@@ -156,6 +156,66 @@ const qualityNegativePatterns = [
   /access_token|backend-api|rate-limit|stack trace|error:/i
 ];
 
+const hardSafetyRules = [
+  {
+    key: "politics_policy",
+    patterns: [
+      /\b(?:politics|political|government|president|prime minister|minister|election|vote|campaign|parliament|congress|senate|democrat|republican|communist party|public policy|government policy|foreign policy|policy reform|propaganda|protest|riot|revolution|sanction|border dispute|territorial dispute)\b/i,
+      /(?:政治|政策|政府|总统|主席|首相|总理|部长|选举|投票|竞选|政党|国会|议会|参议院|众议院|民主党|共和党|共产党|社会主义|民族主义|宣传海报|抗议|游行|暴乱|革命|制裁|领土争端|边境冲突|外交)/
+    ]
+  },
+  {
+    key: "religion",
+    patterns: [
+      /\b(?:religion|religious|christian|christianity|jesus|christ|church|catholic|protestant|orthodox|islam|muslim|allah|quran|mosque|hindu|buddhist|buddha|jewish|judaism|torah|synagogue|sikh|atheist)\b/i,
+      /(?:宗教|基督|耶稣|教堂|天主教|新教|东正教|伊斯兰|穆斯林|真主|古兰经|清真寺|印度教|佛教|佛祖|寺庙|犹太|犹太教|道教|锡克|神像|信徒|无神论)/
+    ]
+  },
+  {
+    key: "racial_ethnic_discrimination",
+    patterns: [
+      /\b(?:racist|racism|racial hate|ethnic hate|ethnic cleansing|white supremacy|black supremacy|master race|inferior race|subhuman race)\b/i,
+      /(?:种族歧视|民族歧视|种族仇恨|种族清洗|劣等民族|劣等种族|高等种族|白人至上|黑人至上|黑鬼|白皮猪|黄皮猴子|支那|倭寇|棒子|阿三|蛮夷)/,
+      /(?:黑人|白人|亚洲人|犹太人|穆斯林|少数族裔|外族|移民|难民).{0,18}(?:低等|劣等|肮脏|恶心|骗子|懒惰|该死|滚出|驱逐|清除|消灭|仇恨|歧视)/,
+      /(?:低等|劣等|肮脏|恶心|骗子|懒惰|该死|滚出|驱逐|清除|消灭|仇恨|歧视).{0,18}(?:黑人|白人|亚洲人|犹太人|穆斯林|少数族裔|外族|移民|难民)/
+    ]
+  },
+  {
+    key: "regional_discrimination",
+    patterns: [
+      /(?:地域歧视|地域黑)/,
+      /(?:河南人|东北人|上海人|北京人|广东人|农村人|乡下人|外地人|本地人|南方人|北方人).{0,18}(?:低等|劣等|肮脏|恶心|骗子|小偷|懒惰|该死|滚出|驱逐|排斥|仇恨|歧视)/,
+      /(?:低等|劣等|肮脏|恶心|骗子|小偷|懒惰|该死|滚出|驱逐|排斥|仇恨|歧视).{0,18}(?:河南人|东北人|上海人|北京人|广东人|农村人|乡下人|外地人|本地人|南方人|北方人)/
+    ]
+  },
+  {
+    key: "gender_sexual_orientation_discrimination",
+    patterns: [
+      /\b(?:sexist|misogyny|misandry|homophobia|transphobia)\b/i,
+      /\b(?:women|men|girls|boys|female|male|gay|lesbian|transgender|lgbtq?)\b.{0,40}\b(?:inferior|subhuman|stupid|disgusting|should be banned|should be deported|should be killed|do not deserve)\b/i,
+      /\b(?:inferior|subhuman|stupid|disgusting|ban|deport|kill|hate)\b.{0,40}\b(?:women|men|girls|boys|female|male|gay|lesbian|transgender|lgbtq?)\b/i,
+      /(?:性别歧视|厌女|仇男|恐同|跨性别歧视|女权婊|母狗|贱女人|男人婆|娘炮)/,
+      /(?:女人|男人|男性|女性|女孩|男孩|同性恋|跨性别|LGBT).{0,18}(?:低等|劣等|肮脏|恶心|变态|愚蠢|该死|滚出|驱逐|清除|消灭|仇恨|歧视)/i,
+      /(?:低等|劣等|肮脏|恶心|变态|愚蠢|该死|滚出|驱逐|清除|消灭|仇恨|歧视).{0,18}(?:女人|男人|男性|女性|女孩|男孩|同性恋|跨性别|LGBT)/i
+    ]
+  }
+];
+
+function safetyGate(originalPrompt, cleanedPrompt = "") {
+  const text = `${String(originalPrompt || "")}\n${String(cleanedPrompt || "")}`;
+  const categories = [];
+  for (const rule of hardSafetyRules) {
+    if (rule.patterns.some((pattern) => pattern.test(text))) {
+      categories.push(rule.key);
+    }
+  }
+  return {
+    blocked: categories.length > 0,
+    categories,
+    reasons: categories.map((category) => `safety_block:${category}`)
+  };
+}
+
 function imageCountFromRow(row) {
   if (Array.isArray(row.image_urls) && row.image_urls.filter(Boolean).length) {
     return new Set(row.image_urls.filter(Boolean)).size;
@@ -167,8 +227,21 @@ function classifyAutoReview(row) {
   const originalPrompt = String(row.prompt || "");
   const cleanedPrompt = cleanPromptText(originalPrompt);
   const text = cleanedPrompt || originalPrompt.trim();
+  const safety = safetyGate(originalPrompt, cleanedPrompt);
   const reasons = [];
   let score = 0;
+  if (safety.blocked) {
+    return {
+      action: "reject",
+      score: -100,
+      reasons: safety.reasons,
+      safetyCategories: safety.categories,
+      cleanedPrompt: text,
+      promptChanged: cleanedPrompt !== originalPrompt.trim(),
+      originalLength: originalPrompt.trim().length,
+      cleanedLength: text.length
+    };
+  }
 
   const imageCount = imageCountFromRow(row);
   if (imageCount > 0) {
@@ -226,6 +299,7 @@ function classifyAutoReview(row) {
     action: reject ? "reject" : "approve",
     score,
     reasons,
+    safetyCategories: [],
     cleanedPrompt: text,
     promptChanged,
     originalLength: originalPrompt.trim().length,
@@ -1931,6 +2005,7 @@ app.post("/api/raw-prompts/auto-review", async (req, res, next) => {
           action: currentReview.action,
           score: currentReview.score,
           reasons: currentReview.reasons,
+          safetyCategories: currentReview.safetyCategories || [],
           promptChanged: currentReview.promptChanged,
           originalLength: currentReview.originalLength,
           cleanedLength: currentReview.cleanedLength,
@@ -2020,6 +2095,45 @@ app.post("/api/raw-prompts/:id/approve", async (req, res, next) => {
     if (!cleanedPrompt || looksEncodingDamaged(cleanedPrompt)) {
       await client.query("ROLLBACK");
       res.status(400).json({ ok: false, error: "PROMPT_QUALITY_FAILED" });
+      return;
+    }
+    const safety = safetyGate(raw.rows[0].prompt, cleanedPrompt);
+    if (safety.blocked) {
+      await client.query(
+        `UPDATE raw_prompt_templates
+         SET prompt = $2,
+             prompt_preview = $3,
+             review_status = 'rejected',
+             reviewed_by = $4,
+             reviewed_at = now(),
+             reject_reason = $5,
+             approved_template_id = NULL,
+             metadata = jsonb_set(
+               metadata,
+               '{safetyReview}',
+               $6::jsonb,
+               true
+             )
+         WHERE id = $1`,
+        [
+          id,
+          cleanedPrompt,
+          previewFromPrompt(cleanedPrompt),
+          reviewer,
+          safety.reasons.join(", ").slice(0, 500),
+          JSON.stringify({
+            blocked: true,
+            categories: safety.categories,
+            reasons: safety.reasons,
+            reviewer,
+            reviewedAt: new Date().toISOString(),
+            source: "manual_approve_gate",
+            version: 1
+          })
+        ]
+      );
+      await client.query("COMMIT");
+      res.status(422).json({ ok: false, error: "PROMPT_SAFETY_BLOCKED", categories: safety.categories });
       return;
     }
     if (cleanedPrompt !== raw.rows[0].prompt) {

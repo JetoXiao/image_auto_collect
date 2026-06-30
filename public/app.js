@@ -942,10 +942,19 @@ async function approvePrompt(id, promptEdit) {
     const saved = await savePrompt(id, promptEdit);
     if (!saved) return;
   }
-  await requestJson(`/api/raw-prompts/${id}/approve`, {
-    method: "POST"
-  });
-  await refresh();
+  try {
+    await requestJson(`/api/raw-prompts/${id}/approve`, {
+      method: "POST"
+    });
+    await refresh();
+  } catch (error) {
+    if (error.message === "PROMPT_SAFETY_BLOCKED") {
+      window.alert("命中安全红线，已自动驳回，不能上架。");
+      await refresh();
+      return;
+    }
+    throw error;
+  }
 }
 
 async function translatePrompt(promptEdit, translation, translationBody, button) {

@@ -19,6 +19,7 @@ const schedulesPath = path.join(dataDir, "scrape-schedules.json");
 const historyPath = path.join(dataDir, "scrape-history.json");
 const sessionCookieName = "prompt_review_sid";
 const sessionMaxAgeMs = 12 * 60 * 60 * 1000;
+const schedulerTimeZone = process.env.SCHEDULER_TIME_ZONE || "Asia/Shanghai";
 const maxImageBytes = 12 * 1024 * 1024;
 const allowedImageHosts = new Set([
   "pbs.twimg.com",
@@ -854,12 +855,25 @@ function scheduleEndDate(schedule, startedAt) {
   if (start === null || end === null) return null;
   const startDate = new Date(startedAt || Date.now());
   if (Number.isNaN(startDate.getTime())) return null;
-  const endDate = new Date(startDate);
-  endDate.setHours(Math.floor(end / 60), end % 60, 0, 0);
-  const startBoundary = new Date(startDate);
-  startBoundary.setHours(Math.floor(start / 60), start % 60, 0, 0);
-  if (endDate <= startBoundary) endDate.setDate(endDate.getDate() + 1);
-  return endDate;
+  const zoned = zonedParts(startDate, schedulerTimeZone);
+  const endUtc = zonedTimeToUtcDate(
+    zoned.year,
+    zoned.month,
+    zoned.day,
+    Math.floor(end / 60),
+    end % 60,
+    schedulerTimeZone
+  );
+  const startBoundary = zonedTimeToUtcDate(
+    zoned.year,
+    zoned.month,
+    zoned.day,
+    Math.floor(start / 60),
+    start % 60,
+    schedulerTimeZone
+  );
+  if (endUtc <= startBoundary) endUtc.setUTCDate(endUtc.getUTCDate() + 1);
+  return endUtc;
 }
 
 function isScheduleStartDue(schedule, now, dateKey) {
@@ -877,14 +891,47 @@ function isScrapeActive() {
 }
 
 function todayKey(date = new Date()) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+  const parts = zonedParts(date, schedulerTimeZone);
+  return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 }
 
 function currentTimeKey(date = new Date()) {
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  const parts = zonedParts(date, schedulerTimeZone);
+  return `${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`;
+}
+
+function zonedParts(date = new Date(), timeZone = schedulerTimeZone) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).formatToParts(date);
+  const value = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, Number(part.value)]));
+  return {
+    year: value.year,
+    month: value.month,
+    day: value.day,
+    hour: value.hour === 24 ? 0 : value.hour,
+    minute: value.minute,
+    second: value.second
+  };
+}
+
+function timeZoneOffsetMs(utcDate, timeZone = schedulerTimeZone) {
+  const parts = zonedParts(utcDate, timeZone);
+  const asUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second || 0);
+  return asUtc - utcDate.getTime();
+}
+
+function zonedTimeToUtcDate(year, month, day, hour, minute, timeZone = schedulerTimeZone) {
+  const guess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
+  const offset = timeZoneOffsetMs(guess, timeZone);
+  return new Date(guess.getTime() - offset);
 }
 
 async function loadSchedulerState() {
@@ -1862,7 +1909,14 @@ app.post("/api/scrape/start", async (_req, res, next) => {
 });
 
 app.get("/api/scrape/schedules", (_req, res) => {
-  res.json({ ok: true, items: scrapeSchedules });
+  const now = new Date();
+  res.json({
+    ok: true,
+    timeZone: schedulerTimeZone,
+    currentDate: todayKey(now),
+    currentTime: currentTimeKey(now),
+    items: scrapeSchedules
+  });
 });
 
 app.post("/api/scrape/schedules", async (req, res, next) => {

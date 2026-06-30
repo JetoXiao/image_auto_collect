@@ -449,6 +449,11 @@ h1 {
   gap: 10px;
 }
 
+.schedule-timezone {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .schedule-card,
 .history-card {
   border: 1px solid var(--line);

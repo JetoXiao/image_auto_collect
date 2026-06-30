@@ -14,6 +14,7 @@ services:
       PGDATABASE: image_auto_collect
       PGUSER: image_auto_collect
       PG_PASSWORD_FILE: /run/secrets/postgres_password
+      SCHEDULER_TIME_ZONE: Asia/Shanghai
       ARCHIVE_IMAGES: "1"
       IMAGE_ARCHIVE_MODE: local
       IMAGE_ARCHIVE_ROOT: /data/image-auto-collect/images

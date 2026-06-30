@@ -493,15 +493,15 @@ async function scrapeAction(action) {
 async function loadSchedules() {
   const data = await requestJson("/api/scrape/schedules");
   state.schedules = data.items || [];
-  renderSchedules();
+  renderSchedules(data);
 }
 
-function renderSchedules() {
+function renderSchedules(scheduleMeta = {}) {
   if (!state.schedules.length) {
-    scheduleList.innerHTML = "<div class=\"empty compact-empty\">暂无定时任务</div>";
+    scheduleList.innerHTML = `<div class="schedule-timezone">按 ${escapeHtml(scheduleMeta.timeZone || "Asia/Shanghai")} 执行，当前 ${escapeHtml(scheduleMeta.currentDate || "-")} ${escapeHtml(scheduleMeta.currentTime || "-")}</div><div class=\"empty compact-empty\">暂无定时任务</div>`;
     return;
   }
-  scheduleList.innerHTML = state.schedules
+  scheduleList.innerHTML = `<div class="schedule-timezone">按 ${escapeHtml(scheduleMeta.timeZone || "Asia/Shanghai")} 执行，当前 ${escapeHtml(scheduleMeta.currentDate || "-")} ${escapeHtml(scheduleMeta.currentTime || "-")}</div>` + state.schedules
     .map(
       (item) => {
         const startTime = item.startTime || item.time || "-";

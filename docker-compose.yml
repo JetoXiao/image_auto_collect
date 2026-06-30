@@ -1,0 +1,62 @@
+services:
+  app:
+    build: .
+    container_name: image-auto-collect-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3017
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: image_auto_collect
+      PGUSER: image_auto_collect
+      PG_PASSWORD_FILE: /run/secrets/postgres_password
+      ARCHIVE_IMAGES: "1"
+      IMAGE_ARCHIVE_ROOT: /data/image-auto-collect/images
+      IMAGE_PUBLIC_BASE: https://useaifor.me/prompt-images
+      UI_SCRAPE_MAX_CREATORS: "500"
+      UI_SCRAPE_MAX_ITEMS_PER_CREATOR: "25"
+    ports:
+      - "127.0.0.1:3017:3017"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - /data/image-auto-collect/images:/data/image-auto-collect/images
+    secrets:
+      - postgres_password
+    networks:
+      - image-auto-collect
+
+  db:
+    image: postgres:18
+    container_name: image-auto-collect-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: image_auto_collect
+      POSTGRES_USER: image_auto_collect
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    secrets:
+      - postgres_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U image_auto_collect -d image_auto_collect"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - image-auto-collect
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+
+volumes:
+  postgres-data:
+
+networks:
+  image-auto-collect:
+    name: image-auto-collect

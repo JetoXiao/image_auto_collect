@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>提示词审核台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Prompt Review</p>
+          <h1>提示词审核台</h1>
+        </div>
+        <div class="topbar-side">
+          <div class="user-chip">
+            <span id="currentUser">未登录</span>
+            <button id="logout" type="button">退出</button>
+          </div>
+          <div class="stats" id="stats"></div>
+        </div>
+      </header>
+
+      <nav class="tabs" aria-label="页面">
+        <button class="active" type="button" data-tab="review">提示词审核</button>
+        <button type="button" data-tab="scrape">采集服务</button>
+        <button type="button" data-tab="creators">博主列表</button>
+        <button type="button" data-tab="approved">已通过管理</button>
+      </nav>
+
+      <section class="tab-page active" id="tab-review">
+        <section class="toolbar" aria-label="筛选">
+          <div class="segmented" role="group" aria-label="状态">
+            <button class="active" data-status="pending" type="button">待审核</button>
+            <button data-status="approved" type="button">已通过</button>
+            <button data-status="duplicate" type="button">重复</button>
+            <button data-status="rejected" type="button">已驳回</button>
+            <button data-status="all" type="button">全部</button>
+          </div>
+          <label class="search">
+            <span>搜索</span>
+            <input id="search" type="search" placeholder="标题、来源、分类、Prompt" />
+          </label>
+          <button id="refresh" class="ghost" type="button">刷新</button>
+        </section>
+
+        <section id="list" class="prompt-list" aria-live="polite"></section>
+        <div class="pager">
+          <button id="prev" type="button">上一页</button>
+          <label>
+            <span>每页</span>
+            <select id="pageSize">
+              <option value="12">12</option>
+              <option value="24" selected>24</option>
+              <option value="48">48</option>
+              <option value="96">96</option>
+            </select>
+          </label>
+          <label>
+            <span>页码</span>
+            <select id="pageSelect"></select>
+          </label>
+          <span id="pageInfo"></span>
+          <button id="next" type="button">下一页</button>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-scrape">
+        <section class="scrape-panel" aria-label="采集控制">
+          <div class="scrape-main">
+            <div class="scrape-title-row">
+              <div>
+                <p class="scrape-kicker">采集服务</p>
+                <h2>推特博主与提示词抓取</h2>
+              </div>
+              <span id="scrapeStatusText" class="scrape-status idle">未启动</span>
+            </div>
+            <div class="scrape-progress" aria-label="采集进度">
+              <span id="scrapeProgressBar"></span>
+            </div>
+            <div id="scrapeProgressLabel" class="scrape-progress-label">等待启动</div>
+            <div id="scrapeDelta" class="scrape-delta"></div>
+            <div id="scrapeTasks" class="scrape-tasks"></div>
+          </div>
+          <div class="scrape-actions">
+            <button id="scrapeStart" class="approve" type="button">启动扒取</button>
+            <button id="scrapePause" type="button">暂停</button>
+            <button id="scrapeResume" type="button">继续</button>
+            <button id="scrapeStop" class="reject" type="button">停止</button>
+          </div>
+          <details class="scrape-log-box">
+            <summary>最近日志</summary>
+            <pre id="scrapeLogs"></pre>
+          </details>
+        </section>
+
+        <section class="schedule-panel" aria-label="定时采集">
+          <div class="section-head">
+            <div>
+              <p class="scrape-kicker">定时任务</p>
+              <h2>每天固定时间窗口自动采集</h2>
+            </div>
+            <form id="scheduleForm" class="schedule-form">
+              <label>
+                <span>开始</span>
+                <input id="scheduleStartTime" type="time" required />
+              </label>
+              <label>
+                <span>结束</span>
+                <input id="scheduleEndTime" type="time" required />
+              </label>
+              <input id="scheduleLabel" type="text" placeholder="备注，如上午采集" />
+              <button class="approve" type="submit">添加定时</button>
+            </form>
+          </div>
+          <div id="scheduleList" class="schedule-list"></div>
+        </section>
+
+        <section class="history-panel" aria-label="采集历史">
+          <div class="section-head">
+            <div>
+              <p class="scrape-kicker">采集日志</p>
+              <h2>每轮采集结果</h2>
+            </div>
+            <button id="scrapeHistoryRefresh" class="ghost" type="button">刷新</button>
+          </div>
+          <div id="scrapeHistory" class="history-list"></div>
+        </section>
+      </section>
+
+      <section class="tab-page" id="tab-creators">
+        <section class="toolbar simple-toolbar" aria-label="博主筛选">
+          <label class="search">
+            <span>搜索</span>
+            <input id="creatorSearch" type="search" placeholder="博主、昵称、简介、发现来源" />
+          </label>
+          <button id="creatorRefresh" class="ghost" type="button">刷新</button>
+        </section>
+        <section id="creatorList" class="creator-grid" aria-live="polite"></section>
+        <div class="pager">
+          <button id="creatorPrev" type="button">上一页</button>
+          <label>
+            <span>每页</span>
+            <select id="creatorPageSize">
+              <option value="24" selected>24</option>
+              <option value="48">48</option>
+              <option value="96">96</option>
+            </select>
+          </label>
+          <label>
+            <span>页码</span>
+            <select id="creatorPageSelect"></select>
+          </label>
+          <span id="creatorPageInfo"></span>
+          <button id="creatorNext" type="button">下一页</button>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-approved">
+        <section class="approved-tools" aria-label="已通过管理">
+          <div class="category-scroll" id="approvedCategories"></div>
+          <div class="category-manage">
+            <label>
+              <span>新增分类</span>
+              <input id="newCategoryName" type="text" placeholder="输入分类名称" />
+            </label>
+            <button id="addCategory" class="approve" type="button">新增分类</button>
+            <label>
+              <span>修改名称</span>
+              <select id="editCategorySelect"></select>
+            </label>
+            <input id="editCategoryName" type="text" placeholder="输入新名称" />
+            <button id="renameCategory" type="button">保存分类名称</button>
+          </div>
+          <label class="search">
+            <span>搜索</span>
+            <input id="approvedSearch" type="search" placeholder="标题、来源、分类、Prompt" />
+          </label>
+          <div class="bulk-row">
+            <span id="approvedSelectedInfo">已选 0 条</span>
+            <select id="bulkCategory"></select>
+            <button id="bulkApplyCategory" class="approve" type="button">批量修改分类</button>
+            <button id="approvedRefresh" class="ghost" type="button">刷新</button>
+          </div>
+        </section>
+        <section id="approvedList" class="approved-list" aria-live="polite"></section>
+        <div class="pager">
+          <button id="approvedPrev" type="button">上一页</button>
+          <label>
+            <span>每页</span>
+            <select id="approvedPageSize">
+              <option value="12" selected>12</option>
+              <option value="24">24</option>
+              <option value="48">48</option>
+            </select>
+          </label>
+          <label>
+            <span>页码</span>
+            <select id="approvedPageSelect"></select>
+          </label>
+          <span id="approvedPageInfo"></span>
+          <button id="approvedNext" type="button">下一页</button>
+        </div>
+      </section>
+    </main>
+
+    <div id="lightbox" class="lightbox" hidden role="dialog" aria-modal="true" aria-label="查看大图">
+      <button id="lightboxClose" class="lightbox-close" type="button" aria-label="关闭">×</button>
+      <button id="lightboxPrev" class="lightbox-nav prev" type="button" aria-label="上一张">‹</button>
+      <figure class="lightbox-figure">
+        <img id="lightboxImage" alt="" />
+        <figcaption>
+          <span id="lightboxTitle"></span>
+          <span id="lightboxCounter"></span>
+          <a id="lightboxOpen" href="#" target="_blank" rel="noreferrer">打开原图</a>
+        </figcaption>
+      </figure>
+      <button id="lightboxNext" class="lightbox-nav next" type="button" aria-label="下一张">›</button>
+    </div>
+
+    <template id="promptTemplate">
+      <article class="prompt-card">
+        <div class="media"></div>
+        <div class="content">
+          <div class="meta-row">
+            <a class="source" target="_blank" rel="noreferrer"></a>
+            <div class="prompt-meta">
+              <span class="scraped-at"></span>
+              <span class="status-pill"></span>
+            </div>
+          </div>
+          <h2></h2>
+          <p class="preview"></p>
+          <dl class="fields">
+            <div>
+              <dt>category</dt>
+              <dd class="category"></dd>
+            </div>
+            <div>
+              <dt>styles[]</dt>
+              <dd class="styles"></dd>
+            </div>
+            <div>
+              <dt>scenes[]</dt>
+              <dd class="scenes"></dd>
+            </div>
+          </dl>
+          <details>
+            <summary>prompt</summary>
+            <textarea class="prompt-edit" spellcheck="false"></textarea>
+          </details>
+          <section class="translation" hidden>
+            <div class="translation-head">
+              <span>中文参考</span>
+              <span>不入库</span>
+            </div>
+            <div class="translation-body"></div>
+          </section>
+          <div class="actions">
+            <button class="approve" type="button">通过</button>
+            <button class="save" type="button">保存修改</button>
+            <button class="translate" type="button">翻译</button>
+            <button class="reject" type="button">驳回</button>
+            <button class="pending" type="button">退回待审</button>
+            <button class="copy" type="button">复制</button>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

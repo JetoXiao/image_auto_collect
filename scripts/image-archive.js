@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 const defaultArchiveHost = "152.53.166.230";
 const defaultArchiveUser = "root";
@@ -9,6 +11,10 @@ const defaultPublicBase = "https://useaifor.me/prompt-images";
 
 function archiveEnabled() {
   return process.env.ARCHIVE_IMAGES !== "0";
+}
+
+function localArchiveEnabled() {
+  return String(process.env.IMAGE_ARCHIVE_MODE || "").toLowerCase() === "local";
 }
 
 function sourceGroup(url) {
@@ -131,6 +137,70 @@ async function runSshWithInput(command, input, timeoutMs = 300000) {
   });
 }
 
+async function downloadFile(url, target, timeoutMs = 60000) {
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  const temp = `${target}.tmp-${process.pid}-${Date.now()}`;
+  await new Promise((resolve, reject) => {
+    const child = spawn(
+      "curl",
+      [
+        "-L",
+        "-sS",
+        "--fail",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        String(Math.ceil(timeoutMs / 1000)),
+        "--retry",
+        "2",
+        "-A",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+        "-H",
+        "Accept: image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "-o",
+        temp,
+        url
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    const stderr = [];
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("IMAGE_ARCHIVE_TIMEOUT"));
+    }, timeoutMs + 5000);
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `IMAGE_ARCHIVE_CURL_${code}`));
+    });
+  });
+  const stat = await fs.stat(temp);
+  if (stat.size < 256 || stat.size > 12582912) {
+    await fs.rm(temp, { force: true });
+    throw new Error(`IMAGE_ARCHIVE_SIZE_${stat.size}`);
+  }
+  await fs.rename(temp, target);
+  await fs.chmod(target, 0o644).catch(() => {});
+}
+
+async function archiveImageRecordsLocal(jobs) {
+  const result = new Map();
+  for (const job of jobs) {
+    try {
+      await fs.access(job.remotePath);
+    } catch {
+      await downloadFile(job.url, job.remotePath);
+    }
+    result.set(job.url, publicUrlFor(job.relativePath));
+  }
+  return result;
+}
+
 async function detectExtension(url) {
   const fromUrl = extensionFromUrl(url);
   if (fromUrl) return fromUrl;
@@ -193,6 +263,8 @@ export async function archiveImageRecords(records) {
       remotePath: `${archiveRoot.replace(/\/$/, "")}/${relativePath}`
     };
   });
+
+  if (localArchiveEnabled()) return archiveImageRecordsLocal(allJobs);
 
   const chunkSize = Number(process.env.IMAGE_ARCHIVE_BATCH_SIZE || 50);
   const result = new Map();

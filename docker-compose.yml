@@ -15,6 +15,7 @@ services:
       PGUSER: image_auto_collect
       PG_PASSWORD_FILE: /run/secrets/postgres_password
       ARCHIVE_IMAGES: "1"
+      IMAGE_ARCHIVE_MODE: local
       IMAGE_ARCHIVE_ROOT: /data/image-auto-collect/images
       IMAGE_PUBLIC_BASE: https://useaifor.me/prompt-images
       UI_SCRAPE_MAX_CREATORS: "500"
@@ -39,7 +40,7 @@ services:
       POSTGRES_USER: image_auto_collect
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql
     secrets:
       - postgres_password
     healthcheck:

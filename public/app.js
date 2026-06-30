@@ -100,6 +100,7 @@ const scrapeStatusLabels = {
   idle: "未启动",
   running: "运行中",
   paused: "已暂停",
+  reviewing: "自动初审中",
   stopping: "停止中",
   stopped: "已停止",
   completed: "已完成",
@@ -391,7 +392,14 @@ function renderScrapeStatus(data) {
     ["提示词总数", data.counts?.rawTotal || 0],
     ["X 来源", data.counts?.xTotal || 0],
     ["博主", data.counts?.creators || 0],
-    ["云端图片", data.counts?.cloudImages || 0]
+    ["云端图片", data.counts?.cloudImages || 0],
+    ...(data.autoReview
+      ? [
+          ["初审扫描", data.autoReview.scanned || 0],
+          ["初审通过", data.autoReview.approved || 0],
+          ["初审驳回", data.autoReview.rejected || 0]
+        ]
+      : [])
   ].map(([label, value]) => `<span><b>${escapeHtml(value)}</b>${label}</span>`).join("");
 
   const tasks = Object.values(data.tasks || {});
@@ -425,19 +433,19 @@ function renderScrapeStatus(data) {
   scrapeLogs.textContent = (data.logs || []).join("\n");
   scrapeLogs.scrollTop = scrapeLogs.scrollHeight;
 
-  scrapeStart.disabled = ["running", "paused", "stopping"].includes(status);
+  scrapeStart.disabled = ["running", "paused", "stopping", "reviewing"].includes(status);
   scrapePause.disabled = status !== "running";
   scrapeResume.disabled = status !== "paused";
   scrapeStop.disabled = !["running", "paused", "stopping"].includes(status);
 
-  if (["running", "paused", "stopping"].includes(status)) startScrapePolling();
+  if (["running", "paused", "stopping", "reviewing"].includes(status)) startScrapePolling();
   else stopScrapePolling();
 }
 
 async function loadScrapeStatus() {
   const data = await requestJson("/api/scrape/status");
   renderScrapeStatus(data);
-  if (["running", "paused", "stopping", "completed", "stopped", "error"].includes(data.status)) {
+  if (["running", "paused", "stopping", "reviewing", "completed", "stopped", "error"].includes(data.status)) {
     loadStats().catch(() => {});
     loadScrapeHistory().catch(() => {});
   }
@@ -1004,7 +1012,13 @@ async function runAutoReview() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ limit: state.limit, search: state.search })
     });
-    await refresh();
+    state.offset = 0;
+    list.innerHTML = "<div class=\"empty\">刷新中...</div>";
+    state.approved.selected.clear();
+    await Promise.all([
+      refresh(),
+      state.tab === "approved" ? loadApprovedPrompts() : Promise.resolve()
+    ]);
     window.alert(
       `智能初审完成：扫描 ${data.scanned || 0} 条，通过 ${data.approved || 0} 条，重复 ${data.duplicate || 0} 条，驳回 ${data.rejected || 0} 条，清洗 ${data.cleaned || 0} 条，失败 ${data.failed || 0} 条`
     );

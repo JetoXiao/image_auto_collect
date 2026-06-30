@@ -307,6 +307,141 @@ function classifyAutoReview(row) {
   };
 }
 
+async function autoReviewPendingPrompts(options = {}) {
+  const client = await pool.connect();
+  try {
+    const reviewer = options.reviewer || "auto";
+    const limit = Math.min(1000, Math.max(1, Math.floor(Number(options.limit || 100))));
+    const search = String(options.search || "").trim();
+    const startedAt = options.startedAt ? new Date(options.startedAt) : null;
+    const endedAt = options.endedAt ? new Date(options.endedAt) : null;
+    const order = options.order === "oldest" ? "oldest" : "latest";
+    const values = [];
+    const clauses = ["review_status = 'pending'"];
+
+    if (search) {
+      values.push(`%${search}%`);
+      clauses.push(`(
+        title ILIKE $${values.length}
+        OR prompt ILIKE $${values.length}
+        OR prompt_preview ILIKE $${values.length}
+        OR category ILIKE $${values.length}
+        OR source_handle ILIKE $${values.length}
+      )`);
+    }
+    if (startedAt && !Number.isNaN(startedAt.getTime())) {
+      values.push(startedAt.toISOString());
+      clauses.push(`scraped_at >= $${values.length}`);
+    }
+    if (endedAt && !Number.isNaN(endedAt.getTime())) {
+      values.push(endedAt.toISOString());
+      clauses.push(`scraped_at <= $${values.length}`);
+    }
+    values.push(limit);
+
+    const sortDirection = order === "oldest" ? "ASC" : "DESC";
+    const candidates = await pool.query(
+      `SELECT *
+       FROM raw_prompt_templates
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY scraped_at ${sortDirection}, id ${sortDirection}
+       LIMIT $${values.length}`,
+      values
+    );
+
+    const summary = {
+      scanned: candidates.rowCount,
+      approved: 0,
+      duplicate: 0,
+      rejected: 0,
+      cleaned: 0,
+      failed: 0,
+      samples: []
+    };
+
+    for (const row of candidates.rows) {
+      try {
+        await client.query("BEGIN");
+        const locked = await client.query("SELECT * FROM raw_prompt_templates WHERE id = $1 FOR UPDATE", [row.id]);
+        if (!locked.rowCount || locked.rows[0].review_status !== "pending") {
+          await client.query("ROLLBACK");
+          continue;
+        }
+        const currentReview = classifyAutoReview(locked.rows[0]);
+        const prompt = currentReview.cleanedPrompt;
+        if (prompt !== locked.rows[0].prompt) summary.cleaned += 1;
+
+        const autoReviewJson = {
+          action: currentReview.action,
+          score: currentReview.score,
+          reasons: currentReview.reasons,
+          safetyCategories: currentReview.safetyCategories || [],
+          promptChanged: currentReview.promptChanged,
+          originalLength: currentReview.originalLength,
+          cleanedLength: currentReview.cleanedLength,
+          reviewer,
+          reviewedAt: new Date().toISOString(),
+          version: 1
+        };
+
+        if (currentReview.action === "approve") {
+          await client.query(
+            `UPDATE raw_prompt_templates
+             SET prompt = $2,
+                 prompt_preview = $3,
+                 metadata = jsonb_set(metadata, '{autoReview}', $4::jsonb, true)
+             WHERE id = $1`,
+            [row.id, prompt, previewFromPrompt(prompt), JSON.stringify(autoReviewJson)]
+          );
+          const approved = await approveRawPromptWithClient(client, row.id, reviewer);
+          if (approved.duplicate) summary.duplicate += 1;
+          else summary.approved += 1;
+        } else {
+          await client.query(
+            `UPDATE raw_prompt_templates
+             SET prompt = $2,
+                 prompt_preview = $3,
+                 review_status = 'rejected',
+                 reviewed_by = $4,
+                 reviewed_at = now(),
+                 reject_reason = $5,
+                 approved_template_id = NULL,
+                 metadata = jsonb_set(metadata, '{autoReview}', $6::jsonb, true)
+             WHERE id = $1`,
+            [
+              row.id,
+              prompt,
+              previewFromPrompt(prompt),
+              reviewer,
+              currentReview.reasons.join(", ").slice(0, 500),
+              JSON.stringify(autoReviewJson)
+            ]
+          );
+          summary.rejected += 1;
+        }
+        await client.query("COMMIT");
+        if (summary.samples.length < 12) {
+          summary.samples.push({
+            id: row.id,
+            action: currentReview.action,
+            score: currentReview.score,
+            reasons: currentReview.reasons,
+            title: row.title || previewFromPrompt(prompt)
+          });
+        }
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        summary.failed += 1;
+        console.error(`Auto review failed for raw prompt ${row.id}:`, error);
+      }
+    }
+
+    return summary;
+  } finally {
+    client.release();
+  }
+}
+
 async function approveRawPromptWithClient(client, id, reviewer) {
   const approval = await client.query(
     `WITH src AS (
@@ -639,6 +774,7 @@ const scrapeRun = {
   before: null,
   finalCounts: null,
   finalDelta: null,
+  autoReview: null,
   requestedStop: false,
   logPath: null,
   tasks: {},
@@ -737,7 +873,7 @@ function isScheduleStartDue(schedule, now, dateKey) {
 }
 
 function isScrapeActive() {
-  return ["running", "paused", "stopping"].includes(scrapeRun.status);
+  return ["running", "paused", "stopping", "reviewing"].includes(scrapeRun.status);
 }
 
 function todayKey(date = new Date()) {
@@ -807,6 +943,7 @@ function resetScrapeRun(beforeCounts, options = {}) {
   scrapeRun.before = beforeCounts;
   scrapeRun.finalCounts = null;
   scrapeRun.finalDelta = null;
+  scrapeRun.autoReview = null;
   scrapeRun.requestedStop = false;
   scrapeRun.logPath = path.join(logsDir, `scrape-ui-${scrapeRun.runId}.log`);
   scrapeRun.logs = [];
@@ -926,12 +1063,37 @@ function finalizeScrapeIfDone() {
 
 async function completeScrapeRun(tasks = Object.values(scrapeRun.tasks || {})) {
   if (scrapeRun.endedAt) return;
+  const taskEndedAt = new Date().toISOString();
+  let finalStatus;
+  if (scrapeRun.requestedStop) finalStatus = "stopped";
+  else if (tasks.some((task) => task.status === "failed")) finalStatus = "error";
+  else finalStatus = "completed";
+  let autoReviewSummary = null;
+  if (finalStatus === "completed" && scrapeRun.startedAt) {
+    scrapeRun.status = "reviewing";
+    addScrapeLog("开始自动初审本轮新增提示词");
+    try {
+      autoReviewSummary = await autoReviewPendingPrompts({
+        reviewer: "auto:scrape",
+        limit: 1000,
+        startedAt: scrapeRun.startedAt,
+        endedAt: taskEndedAt,
+        order: "oldest"
+      });
+      addScrapeLog(
+        `自动初审完成：扫描 ${autoReviewSummary.scanned}，通过 ${autoReviewSummary.approved}，重复 ${autoReviewSummary.duplicate}，驳回 ${autoReviewSummary.rejected}，清洗 ${autoReviewSummary.cleaned}，失败 ${autoReviewSummary.failed}`
+      );
+    } catch (error) {
+      autoReviewSummary = { error: error.message };
+      addScrapeLog(`自动初审失败：${error.message}`);
+      console.error("Auto review after scrape failed:", error);
+    }
+  }
   scrapeRun.endedAt = new Date().toISOString();
-  if (scrapeRun.requestedStop) scrapeRun.status = "stopped";
-  else if (tasks.some((task) => task.status === "failed")) scrapeRun.status = "error";
-  else scrapeRun.status = "completed";
+  scrapeRun.status = finalStatus;
   const counts = await readScrapeCounts().catch(() => null);
   scrapeRun.finalCounts = counts;
+  scrapeRun.autoReview = autoReviewSummary;
   scrapeRun.finalDelta = counts && scrapeRun.before
     ? {
         raw: counts.rawTotal - scrapeRun.before.rawTotal,
@@ -952,6 +1114,7 @@ async function completeScrapeRun(tasks = Object.values(scrapeRun.tasks || {})) {
     before: scrapeRun.before,
     counts,
     delta: scrapeRun.finalDelta,
+    autoReview: autoReviewSummary,
     tasks: Object.fromEntries(Object.entries(scrapeRun.tasks || {}).map(([name, task]) => [name, publicTask(task)])),
     logs: scrapeRun.logs.slice(-80),
     logPath: scrapeRun.logPath
@@ -1054,6 +1217,7 @@ async function publicScrapeStatus() {
     scheduleEndAt: scrapeRun.scheduleEndAt,
     startedAt: scrapeRun.startedAt,
     endedAt: scrapeRun.endedAt,
+    autoReview: scrapeRun.autoReview,
     progress: scrapeProgress(),
     before,
     counts,
@@ -1950,127 +2114,17 @@ app.patch("/api/raw-prompts/:id", async (req, res, next) => {
 });
 
 app.post("/api/raw-prompts/auto-review", async (req, res, next) => {
-  const client = await pool.connect();
   try {
     const reviewer = req.user?.username || "unknown";
-    const limit = Math.min(500, Math.max(1, Math.floor(Number(req.body?.limit || 100))));
-    const search = String(req.body?.search || "").trim();
-    const values = [];
-    const clauses = ["review_status = 'pending'"];
-    if (search) {
-      values.push(`%${search}%`);
-      clauses.push(`(
-        title ILIKE $${values.length}
-        OR prompt ILIKE $${values.length}
-        OR prompt_preview ILIKE $${values.length}
-        OR category ILIKE $${values.length}
-        OR source_handle ILIKE $${values.length}
-      )`);
-    }
-    values.push(limit);
-
-    const candidates = await pool.query(
-      `SELECT *
-       FROM raw_prompt_templates
-       WHERE ${clauses.join(" AND ")}
-       ORDER BY scraped_at ASC, id ASC
-       LIMIT $${values.length}`,
-      values
-    );
-
-    const summary = {
-      scanned: candidates.rowCount,
-      approved: 0,
-      duplicate: 0,
-      rejected: 0,
-      cleaned: 0,
-      failed: 0,
-      samples: []
-    };
-
-    for (const row of candidates.rows) {
-      const review = classifyAutoReview(row);
-      try {
-        await client.query("BEGIN");
-        const locked = await client.query("SELECT * FROM raw_prompt_templates WHERE id = $1 FOR UPDATE", [row.id]);
-        if (!locked.rowCount || locked.rows[0].review_status !== "pending") {
-          await client.query("ROLLBACK");
-          continue;
-        }
-        const currentReview = classifyAutoReview(locked.rows[0]);
-        const prompt = currentReview.cleanedPrompt;
-        if (prompt !== locked.rows[0].prompt) summary.cleaned += 1;
-
-        const autoReviewJson = {
-          action: currentReview.action,
-          score: currentReview.score,
-          reasons: currentReview.reasons,
-          safetyCategories: currentReview.safetyCategories || [],
-          promptChanged: currentReview.promptChanged,
-          originalLength: currentReview.originalLength,
-          cleanedLength: currentReview.cleanedLength,
-          reviewer,
-          reviewedAt: new Date().toISOString(),
-          version: 1
-        };
-
-        if (currentReview.action === "approve") {
-          await client.query(
-            `UPDATE raw_prompt_templates
-             SET prompt = $2,
-                 prompt_preview = $3,
-                 metadata = jsonb_set(metadata, '{autoReview}', $4::jsonb, true)
-             WHERE id = $1`,
-            [row.id, prompt, previewFromPrompt(prompt), JSON.stringify(autoReviewJson)]
-          );
-          const approved = await approveRawPromptWithClient(client, row.id, `auto:${reviewer}`);
-          if (approved.duplicate) summary.duplicate += 1;
-          else summary.approved += 1;
-        } else {
-          await client.query(
-            `UPDATE raw_prompt_templates
-             SET prompt = $2,
-                 prompt_preview = $3,
-                 review_status = 'rejected',
-                 reviewed_by = $4,
-                 reviewed_at = now(),
-                 reject_reason = $5,
-                 approved_template_id = NULL,
-                 metadata = jsonb_set(metadata, '{autoReview}', $6::jsonb, true)
-             WHERE id = $1`,
-            [
-              row.id,
-              prompt,
-              previewFromPrompt(prompt),
-              `auto:${reviewer}`,
-              currentReview.reasons.join(", ").slice(0, 500),
-              JSON.stringify(autoReviewJson)
-            ]
-          );
-          summary.rejected += 1;
-        }
-        await client.query("COMMIT");
-        if (summary.samples.length < 12) {
-          summary.samples.push({
-            id: row.id,
-            action: currentReview.action,
-            score: currentReview.score,
-            reasons: currentReview.reasons,
-            title: row.title || previewFromPrompt(prompt)
-          });
-        }
-      } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
-        summary.failed += 1;
-        console.error(`Auto review failed for raw prompt ${row.id}:`, error);
-      }
-    }
-
+    const summary = await autoReviewPendingPrompts({
+      reviewer: `auto:${reviewer}`,
+      limit: req.body?.limit || 100,
+      search: req.body?.search || "",
+      order: "latest"
+    });
     res.json({ ok: true, ...summary });
   } catch (error) {
     next(error);
-  } finally {
-    client.release();
   }
 });
 

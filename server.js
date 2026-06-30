@@ -805,6 +805,11 @@ const doingfbRun = {
   logs: []
 };
 
+const doingfbBatchReviewState = {
+  lastCursor: 0,
+  running: false
+};
+
 let scrapeSchedules = [];
 let scrapeHistory = [];
 let scheduleTimer = null;
@@ -1066,6 +1071,8 @@ function resetDoingfbRun(beforeCounts) {
   doingfbRun.logPath = path.join(logsDir, `doingfb-ui-${doingfbRun.runId}.log`);
   doingfbRun.logs = [];
   doingfbRun.task = doingfbTaskTemplate();
+  doingfbBatchReviewState.lastCursor = 0;
+  doingfbBatchReviewState.running = false;
 }
 
 function doingfbProgress() {
@@ -1118,6 +1125,50 @@ function handleDoingfbOutput(task, chunk, streamName) {
     task.lastLine = line;
     parseDoingfbTaskLine(task, line);
     addDoingfbLog(`[DoingFB] ${line}`);
+    if (/^DOINGFB_PROGRESS\s+/i.test(line)) {
+      reviewDoingfbBatch().catch((error) => {
+        addDoingfbLog(`DoingFB 批次初审触发失败：${error.message}`);
+        console.error("DoingFB batch review trigger failed:", error);
+      });
+    }
+  }
+}
+
+async function reviewDoingfbBatch(force = false) {
+  if (doingfbBatchReviewState.running) return null;
+  if (!doingfbRun.startedAt) return null;
+  const task = doingfbRun.task;
+  const cursor = Number(task?.fetched || 0);
+  if (!force && cursor <= doingfbBatchReviewState.lastCursor) return null;
+
+  doingfbBatchReviewState.running = true;
+  doingfbBatchReviewState.lastCursor = Math.max(doingfbBatchReviewState.lastCursor, cursor);
+  addDoingfbLog(`开始自动初审 DoingFB 批次：已抓取 ${cursor || "-"}`);
+  try {
+    const summary = await autoReviewPendingPrompts({
+      reviewer: "auto:doingfb",
+      limit: 1000,
+      sourcePlatform: "doingfb",
+      startedAt: doingfbRun.startedAt,
+      endedAt: new Date().toISOString(),
+      order: "oldest"
+    });
+    doingfbRun.autoReview = {
+      scanned: (doingfbRun.autoReview?.scanned || 0) + summary.scanned,
+      approved: (doingfbRun.autoReview?.approved || 0) + summary.approved,
+      duplicate: (doingfbRun.autoReview?.duplicate || 0) + summary.duplicate,
+      rejected: (doingfbRun.autoReview?.rejected || 0) + summary.rejected,
+      cleaned: (doingfbRun.autoReview?.cleaned || 0) + summary.cleaned,
+      failed: (doingfbRun.autoReview?.failed || 0) + summary.failed,
+      lastBatch: summary,
+      updatedAt: new Date().toISOString()
+    };
+    addDoingfbLog(
+      `DoingFB 批次初审完成：扫描 ${summary.scanned}，通过 ${summary.approved}，重复 ${summary.duplicate}，驳回 ${summary.rejected}，清理 ${summary.cleaned}，失败 ${summary.failed}`
+    );
+    return summary;
+  } finally {
+    doingfbBatchReviewState.running = false;
   }
 }
 
@@ -1132,18 +1183,11 @@ async function completeDoingfbRun(task = doingfbRun.task) {
   let autoReviewSummary = null;
   if (finalStatus === "completed" && doingfbRun.startedAt) {
     doingfbRun.status = "reviewing";
-    addDoingfbLog("开始自动初审本轮 DoingFB 新增提示词");
+    addDoingfbLog("开始自动初审本轮 DoingFB 剩余提示词");
     try {
-      autoReviewSummary = await autoReviewPendingPrompts({
-        reviewer: "auto:doingfb",
-        limit: 10000,
-        sourcePlatform: "doingfb",
-        startedAt: doingfbRun.startedAt,
-        endedAt: taskEndedAt,
-        order: "oldest"
-      });
+      autoReviewSummary = await reviewDoingfbBatch(true);
       addDoingfbLog(
-        `自动初审完成：扫描 ${autoReviewSummary.scanned}，通过 ${autoReviewSummary.approved}，重复 ${autoReviewSummary.duplicate}，驳回 ${autoReviewSummary.rejected}，清理 ${autoReviewSummary.cleaned}，失败 ${autoReviewSummary.failed}`
+        `自动初审累计：扫描 ${doingfbRun.autoReview?.scanned || 0}，通过 ${doingfbRun.autoReview?.approved || 0}，重复 ${doingfbRun.autoReview?.duplicate || 0}，驳回 ${doingfbRun.autoReview?.rejected || 0}，清理 ${doingfbRun.autoReview?.cleaned || 0}，失败 ${doingfbRun.autoReview?.failed || 0}`
       );
     } catch (error) {
       autoReviewSummary = { error: error.message };
@@ -1156,7 +1200,7 @@ async function completeDoingfbRun(task = doingfbRun.task) {
   doingfbRun.status = finalStatus;
   const counts = await readScrapeCounts().catch(() => null);
   doingfbRun.finalCounts = counts;
-  doingfbRun.autoReview = autoReviewSummary;
+  doingfbRun.autoReview = doingfbRun.autoReview || autoReviewSummary;
   doingfbRun.finalDelta = counts && doingfbRun.before
     ? {
         raw: counts.rawTotal - doingfbRun.before.rawTotal,
@@ -2453,6 +2497,7 @@ app.post("/api/raw-prompts/auto-review", async (req, res, next) => {
       reviewer: `auto:${reviewer}`,
       limit: req.body?.limit || 100,
       search: req.body?.search || "",
+      sourcePlatform: req.body?.sourcePlatform || "",
       order: "latest"
     });
     res.json({ ok: true, ...summary });

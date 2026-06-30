@@ -14,21 +14,6 @@ function normalizeAuthorName(value) {
   return String(value || "DoingFB").replace(/\s+/g, " ").trim().slice(0, 120) || "DoingFB";
 }
 
-function slugSegment(value, fallback = "doingfb") {
-  const slug = String(value || fallback)
-    .normalize("NFKD")
-    .replace(/[^\w-]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 40);
-  return slug || fallback;
-}
-
-function creatorHandle(item) {
-  const author = normalizeAuthorName(item.authorName || item.author?.username || item.author?.name);
-  const digest = createHash("sha1").update(author).digest("hex").slice(0, 8);
-  return `@doingfb_${slugSegment(author, "author").toLowerCase()}_${digest}`;
-}
-
 function sourceUrl(item) {
   return `${SOURCE_BASE}/?prompt=${encodeURIComponent(item.id)}`;
 }
@@ -50,7 +35,7 @@ function normalizePrompt(item) {
     id: String(item.id),
     externalCaseId: `doingfb:${item.id}`,
     sourcePlatform: "doingfb",
-    sourceHandle: creatorHandle(item),
+    sourceHandle: "DoingFB",
     sourceUrl: sourceUrl(item),
     title,
     authorName,
@@ -98,35 +83,6 @@ async function fetchJson(url) {
   }
 }
 
-async function upsertCreator(client, item) {
-  const handle = item.sourceHandle;
-  const result = await client.query(
-    `INSERT INTO twitter_creators
-      (handle, profile_url, display_name, source_case_count, discovery_source, discovery_query,
-       discovery_score, discovery_metadata, first_discovered_at, last_discovered_at, last_seen_at)
-     VALUES
-      ($1, $2, $3, 1, 'doingfb', 'prompt.doingfb.com', 50, $4, now(), now(), now())
-     ON CONFLICT (handle_normalized) DO UPDATE SET
-       display_name = COALESCE(EXCLUDED.display_name, twitter_creators.display_name),
-       source_case_count = GREATEST(twitter_creators.source_case_count, 1),
-       discovery_source = COALESCE(twitter_creators.discovery_source, EXCLUDED.discovery_source),
-       discovery_metadata = twitter_creators.discovery_metadata || EXCLUDED.discovery_metadata,
-       last_discovered_at = now(),
-       last_seen_at = now()
-     RETURNING id`,
-    [
-      handle,
-      `${SOURCE_BASE}/`,
-      item.authorName,
-      {
-        source: "doingfb",
-        authorName: item.authorName
-      }
-    ]
-  );
-  return result.rows[0].id;
-}
-
 async function insertPrompt(client, item) {
   let archivedImages = [];
   try {
@@ -141,7 +97,6 @@ async function insertPrompt(client, item) {
 
   if (!archivedImages.length) return { inserted: false, reason: "image_archive_empty" };
 
-  const creatorId = await upsertCreator(client, item);
   const result = await client.query(
     `INSERT INTO raw_prompt_templates
       (creator_id, source_platform, source_handle, source_url, source_tweet_id, external_case_id,
@@ -152,7 +107,7 @@ async function insertPrompt(client, item) {
      ON CONFLICT DO NOTHING
      RETURNING id`,
     [
-      creatorId,
+      null,
       item.sourcePlatform,
       item.sourceHandle,
       item.sourceUrl,

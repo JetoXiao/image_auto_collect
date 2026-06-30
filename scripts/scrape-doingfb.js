@@ -208,8 +208,8 @@ async function main() {
     await pool.end();
   }
 
-  summary.details = summary.details.slice(-80);
-  console.log(JSON.stringify(summary, null, 2));
+  summary.details = summary.details.slice(-20);
+  console.log(`DOINGFB_SUMMARY ${JSON.stringify(summary)}`);
 }
 
 main().catch((error) => {

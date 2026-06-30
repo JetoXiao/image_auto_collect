@@ -54,6 +54,14 @@ const scrapeStart = document.querySelector("#scrapeStart");
 const scrapePause = document.querySelector("#scrapePause");
 const scrapeResume = document.querySelector("#scrapeResume");
 const scrapeStop = document.querySelector("#scrapeStop");
+const doingfbStatusText = document.querySelector("#doingfbStatusText");
+const doingfbProgressBar = document.querySelector("#doingfbProgressBar");
+const doingfbProgressLabel = document.querySelector("#doingfbProgressLabel");
+const doingfbDelta = document.querySelector("#doingfbDelta");
+const doingfbTask = document.querySelector("#doingfbTask");
+const doingfbLogs = document.querySelector("#doingfbLogs");
+const doingfbStart = document.querySelector("#doingfbStart");
+const doingfbStop = document.querySelector("#doingfbStop");
 const scheduleForm = document.querySelector("#scheduleForm");
 const scheduleStartTime = document.querySelector("#scheduleStartTime");
 const scheduleEndTime = document.querySelector("#scheduleEndTime");
@@ -88,6 +96,7 @@ let activeImages = [];
 let activeImageIndex = 0;
 let activeImageTitle = "";
 let scrapePollTimer = null;
+let doingfbPollTimer = null;
 
 const statusLabels = {
   pending: "待审核",
@@ -114,6 +123,16 @@ const taskStatusLabels = {
   completed: "完成",
   failed: "失败",
   stopped: "已停止"
+};
+
+const doingfbStatusLabels = {
+  idle: "未启动",
+  running: "运行中",
+  reviewing: "自动初审中",
+  stopping: "停止中",
+  stopped: "已停止",
+  completed: "已完成",
+  error: "异常"
 };
 
 function activeCategoryOptions() {
@@ -485,6 +504,116 @@ async function scrapeAction(action) {
   } catch (error) {
     window.alert(error.message);
     await loadScrapeStatus().catch(() => {});
+  } finally {
+    button.textContent = oldText;
+  }
+}
+
+function renderDoingfbTask(task) {
+  if (!task) {
+    doingfbTask.innerHTML = "<div class=\"scrape-task muted\">暂无任务</div>";
+    return;
+  }
+  const taskProgress = task.total ? Math.round((Math.min(task.current, task.total) / task.total) * 100) : 0;
+  const parts = [
+    task.phase,
+    task.subject,
+    task.total ? `${task.current}/${task.total}` : "",
+    `已抓取 ${task.fetched || 0}`,
+    `新增 ${task.inserted || 0}`,
+    task.skipped ? `跳过 ${task.skipped}` : "",
+    task.errors ? `错误 ${task.errors}` : ""
+  ].filter(Boolean);
+  doingfbTask.innerHTML = `
+    <div class="scrape-task">
+      <div class="scrape-task-head">
+        <strong>${escapeHtml(task.label || "DoingFB")}</strong>
+        <span>${escapeHtml(taskStatusLabels[task.status] || task.status)} · ${taskProgress}%</span>
+      </div>
+      <div class="scrape-task-bar"><span style="width: ${taskProgress}%"></span></div>
+      <p>${escapeHtml(parts.join(" · "))}</p>
+    </div>
+  `;
+}
+
+function renderDoingfbStatus(data) {
+  const status = data.status || "idle";
+  const progress = Math.max(0, Math.min(100, Number(data.progress || 0)));
+  doingfbStatusText.textContent = doingfbStatusLabels[status] || status;
+  doingfbStatusText.className = `scrape-status ${status}`;
+  doingfbProgressBar.style.width = `${progress}%`;
+  doingfbProgressLabel.textContent =
+    status === "idle"
+      ? "等待手动启动"
+      : `${progress}% · 本轮新增 ${data.delta?.doingfb || 0} 条 · 自动入库 ${data.delta?.approved || 0} 条 · 云端图片 ${data.delta?.cloudImages || 0} 张`;
+
+  doingfbDelta.innerHTML = [
+    ["DoingFB 总数", data.counts?.doingfbTotal || 0],
+    ["提示词总数", data.counts?.rawTotal || 0],
+    ["正式表", data.counts?.approved || 0],
+    ["云端图片", data.counts?.cloudImages || 0],
+    ...(data.autoReview
+      ? [
+          ["初审扫描", data.autoReview.scanned || 0],
+          ["初审通过", data.autoReview.approved || 0],
+          ["初审驳回", data.autoReview.rejected || 0]
+        ]
+      : [])
+  ].map(([label, value]) => `<span><b>${escapeHtml(value)}</b>${label}</span>`).join("");
+
+  renderDoingfbTask(data.task);
+  doingfbLogs.textContent = (data.logs || []).join("\n");
+  doingfbLogs.scrollTop = doingfbLogs.scrollHeight;
+
+  doingfbStart.disabled = ["running", "stopping", "reviewing"].includes(status);
+  doingfbStop.disabled = !["running", "stopping"].includes(status);
+
+  if (["running", "stopping", "reviewing"].includes(status)) startDoingfbPolling();
+  else stopDoingfbPolling();
+}
+
+async function loadDoingfbStatus() {
+  const data = await requestJson("/api/doingfb/status");
+  renderDoingfbStatus(data);
+  if (["running", "stopping", "reviewing", "completed", "stopped", "error"].includes(data.status)) {
+    loadStats().catch(() => {});
+    if (state.tab === "review") loadPrompts().catch(() => {});
+    if (state.tab === "approved") loadApprovedPrompts().catch(() => {});
+  }
+  return data;
+}
+
+function startDoingfbPolling() {
+  if (doingfbPollTimer) return;
+  doingfbPollTimer = window.setInterval(() => {
+    loadDoingfbStatus().catch((error) => {
+      doingfbProgressLabel.textContent = `DoingFB 状态读取失败：${error.message}`;
+    });
+  }, 2000);
+}
+
+function stopDoingfbPolling() {
+  if (!doingfbPollTimer) return;
+  window.clearInterval(doingfbPollTimer);
+  doingfbPollTimer = null;
+}
+
+async function doingfbAction(action) {
+  const button = action === "start" ? doingfbStart : doingfbStop;
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = action === "start" ? "启动中..." : "停止中...";
+  try {
+    const data = await requestJson(`/api/doingfb/${action}`, { method: "POST" });
+    renderDoingfbStatus(data);
+    await Promise.all([
+      loadStats(),
+      state.tab === "review" ? loadPrompts() : Promise.resolve(),
+      state.tab === "approved" ? loadApprovedPrompts() : Promise.resolve()
+    ]);
+  } catch (error) {
+    window.alert(error.message);
+    await loadDoingfbStatus().catch(() => {});
   } finally {
     button.textContent = oldText;
   }
@@ -1045,7 +1174,7 @@ async function switchTab(tab) {
   if (tab === "review") {
     await refresh();
   } else if (tab === "scrape") {
-    await Promise.all([loadStats(), loadScrapeStatus(), loadSchedules(), loadScrapeHistory()]);
+    await Promise.all([loadStats(), loadScrapeStatus(), loadDoingfbStatus(), loadSchedules(), loadScrapeHistory()]);
   } else if (tab === "creators") {
     await Promise.all([loadStats(), loadCreators()]);
   } else if (tab === "approved") {
@@ -1093,9 +1222,11 @@ scrapeStart.addEventListener("click", () => scrapeAction("start"));
 scrapePause.addEventListener("click", () => scrapeAction("pause"));
 scrapeResume.addEventListener("click", () => scrapeAction("resume"));
 scrapeStop.addEventListener("click", () => scrapeAction("stop"));
+doingfbStart.addEventListener("click", () => doingfbAction("start"));
+doingfbStop.addEventListener("click", () => doingfbAction("stop"));
 scheduleForm.addEventListener("submit", (event) => addSchedule(event).catch((error) => window.alert(error.message)));
 document.querySelector("#scrapeHistoryRefresh").addEventListener("click", () =>
-  Promise.all([loadScrapeStatus(), loadSchedules(), loadScrapeHistory()]).catch((error) => window.alert(error.message))
+  Promise.all([loadScrapeStatus(), loadDoingfbStatus(), loadSchedules(), loadScrapeHistory()]).catch((error) => window.alert(error.message))
 );
 document.querySelector("#lightboxClose").addEventListener("click", closeLightbox);
 lightbox.addEventListener("click", (event) => {
@@ -1211,6 +1342,9 @@ loadCurrentUser()
       }),
       loadScrapeStatus().catch((error) => {
         scrapeProgressLabel.textContent = `采集状态读取失败：${error.message}`;
+      }),
+      loadDoingfbStatus().catch((error) => {
+        doingfbProgressLabel.textContent = `DoingFB 状态读取失败：${error.message}`;
       }),
       loadSchedules().catch(() => {}),
       loadScrapeHistory().catch(() => {})

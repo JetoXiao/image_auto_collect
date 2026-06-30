@@ -8,7 +8,9 @@
     "seed": "node scripts/import-seed.js",
     "discover:creators": "node scripts/discover-twitter-creators.js",
     "collect:prompts": "node scripts/scrape-twitter-rss.js",
+    "collect:doingfb": "node scripts/scrape-doingfb.js",
     "scrape:prompts": "node scripts/scrape-twitter-rss.js",
+    "scrape:doingfb": "node scripts/scrape-doingfb.js",
     "scrape": "node scripts/scrape-twitter-rss.js",
     "start": "node server.js"
   },

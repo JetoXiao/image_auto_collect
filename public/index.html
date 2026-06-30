@@ -96,6 +96,32 @@
           </details>
         </section>
 
+        <section class="scrape-panel doingfb-panel" aria-label="DoingFB prompt scrape">
+          <div class="scrape-main">
+            <div class="scrape-title-row">
+              <div>
+                <p class="scrape-kicker">DoingFB 数据源</p>
+                <h2>prompt.doingfb.com 图片与提示词采集</h2>
+              </div>
+              <span id="doingfbStatusText" class="scrape-status idle">未启动</span>
+            </div>
+            <div class="scrape-progress" aria-label="DoingFB scrape progress">
+              <span id="doingfbProgressBar"></span>
+            </div>
+            <div id="doingfbProgressLabel" class="scrape-progress-label">等待手动启动</div>
+            <div id="doingfbDelta" class="scrape-delta"></div>
+            <div id="doingfbTask" class="scrape-tasks single"></div>
+          </div>
+          <div class="scrape-actions single-actions">
+            <button id="doingfbStart" class="approve" type="button">启动 DoingFB 采集</button>
+            <button id="doingfbStop" class="reject" type="button">停止</button>
+          </div>
+          <details class="scrape-log-box">
+            <summary>DoingFB 最近日志</summary>
+            <pre id="doingfbLogs"></pre>
+          </details>
+        </section>
+
         <section class="schedule-panel" aria-label="定时采集">
           <div class="section-head">
             <div>

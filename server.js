@@ -27,6 +27,7 @@ const allowedImageHosts = new Set([
   "ton.twimg.com",
   "video.twimg.com",
   "43.167.208.107",
+  "cdn-prompts.doingfb.com",
   "useaifor.me"
 ]);
 
@@ -312,8 +313,9 @@ async function autoReviewPendingPrompts(options = {}) {
   const client = await pool.connect();
   try {
     const reviewer = options.reviewer || "auto";
-    const limit = Math.min(1000, Math.max(1, Math.floor(Number(options.limit || 100))));
+    const limit = Math.min(10000, Math.max(1, Math.floor(Number(options.limit || 100))));
     const search = String(options.search || "").trim();
+    const sourcePlatform = String(options.sourcePlatform || "").trim();
     const startedAt = options.startedAt ? new Date(options.startedAt) : null;
     const endedAt = options.endedAt ? new Date(options.endedAt) : null;
     const order = options.order === "oldest" ? "oldest" : "latest";
@@ -329,6 +331,10 @@ async function autoReviewPendingPrompts(options = {}) {
         OR category ILIKE $${values.length}
         OR source_handle ILIKE $${values.length}
       )`);
+    }
+    if (sourcePlatform) {
+      values.push(sourcePlatform);
+      clauses.push(`source_platform = $${values.length}`);
     }
     if (startedAt && !Number.isNaN(startedAt.getTime())) {
       values.push(startedAt.toISOString());
@@ -574,6 +580,7 @@ async function readScrapeCounts() {
       `SELECT
         count(*)::int AS raw_total,
         count(*) FILTER (WHERE source_platform = 'x')::int AS x_total,
+        count(*) FILTER (WHERE source_platform = 'doingfb')::int AS doingfb_total,
         count(*) FILTER (WHERE review_status = 'pending')::int AS pending_total,
         count(*) FILTER (WHERE image_url LIKE 'https://useaifor.me/prompt-images/%')::int AS cloud_images
        FROM raw_prompt_templates`
@@ -584,6 +591,7 @@ async function readScrapeCounts() {
   return {
     rawTotal: raw.rows[0]?.raw_total || 0,
     xTotal: raw.rows[0]?.x_total || 0,
+    doingfbTotal: raw.rows[0]?.doingfb_total || 0,
     pendingTotal: raw.rows[0]?.pending_total || 0,
     cloudImages: raw.rows[0]?.cloud_images || 0,
     creators: creators.rows[0]?.count || 0,
@@ -782,6 +790,21 @@ const scrapeRun = {
   logs: []
 };
 
+const doingfbRun = {
+  status: "idle",
+  runId: null,
+  startedAt: null,
+  endedAt: null,
+  before: null,
+  finalCounts: null,
+  finalDelta: null,
+  autoReview: null,
+  requestedStop: false,
+  logPath: null,
+  task: null,
+  logs: []
+};
+
 let scrapeSchedules = [];
 let scrapeHistory = [];
 let scheduleTimer = null;
@@ -888,6 +911,10 @@ function isScheduleStartDue(schedule, now, dateKey) {
 
 function isScrapeActive() {
   return ["running", "paused", "stopping", "reviewing"].includes(scrapeRun.status);
+}
+
+function isDoingfbActive() {
+  return ["running", "stopping", "reviewing"].includes(doingfbRun.status);
 }
 
 function todayKey(date = new Date()) {
@@ -1020,6 +1047,224 @@ function publicTask(task) {
     startedAt: task.startedAt,
     endedAt: task.endedAt
   };
+}
+
+function doingfbTaskTemplate() {
+  return taskTemplate("doingfb", "DoingFB");
+}
+
+function resetDoingfbRun(beforeCounts) {
+  doingfbRun.status = "running";
+  doingfbRun.runId = timestampForFile();
+  doingfbRun.startedAt = new Date().toISOString();
+  doingfbRun.endedAt = null;
+  doingfbRun.before = beforeCounts;
+  doingfbRun.finalCounts = null;
+  doingfbRun.finalDelta = null;
+  doingfbRun.autoReview = null;
+  doingfbRun.requestedStop = false;
+  doingfbRun.logPath = path.join(logsDir, `doingfb-ui-${doingfbRun.runId}.log`);
+  doingfbRun.logs = [];
+  doingfbRun.task = doingfbTaskTemplate();
+}
+
+function doingfbProgress() {
+  const task = doingfbRun.task;
+  if (!task) return 0;
+  if (["completed", "stopped"].includes(task.status)) return 100;
+  if (task.status === "failed") return task.total ? Math.round((task.current / task.total) * 100) : 100;
+  return task.total ? Math.round((Math.min(task.current, task.total) / task.total) * 100) : 0;
+}
+
+function addDoingfbLog(line) {
+  const text = String(line || "").trimEnd();
+  if (!text) return;
+  const entry = `${new Date().toLocaleTimeString("zh-CN", { hour12: false })} ${text}`;
+  doingfbRun.logs.push(entry);
+  if (doingfbRun.logs.length > 120) doingfbRun.logs.splice(0, doingfbRun.logs.length - 120);
+  if (doingfbRun.logPath) {
+    fs.mkdir(path.dirname(doingfbRun.logPath), { recursive: true })
+      .then(() => fs.appendFile(doingfbRun.logPath, `${entry}\n`, "utf8"))
+      .catch((error) => console.warn("Failed to write DoingFB log:", error.message));
+  }
+}
+
+function parseDoingfbTaskLine(task, line) {
+  const progress = line.match(
+    /^DOINGFB_PROGRESS\s+current=(\d+)\s+total=(\d+)\s+fetched=(\d+)\s+inserted=(\d+)\s+skipped=(\d+)\s+errors=(\d+)\s+subject=(.*)$/i
+  );
+  if (progress) {
+    const [, current, total, fetched, inserted, skipped, errors, subject] = progress;
+    task.current = Number(current);
+    task.total = Number(total);
+    task.fetched = Number(fetched);
+    task.inserted = Number(inserted);
+    task.skipped = Number(skipped);
+    task.errors = Number(errors);
+    task.subject = subject || "";
+    task.phase = "分页采集";
+    return;
+  }
+  if (/DOINGFB_ERROR|error=/i.test(line) || /^Error:/i.test(line)) task.errors += 1;
+}
+
+function handleDoingfbOutput(task, chunk, streamName) {
+  const field = streamName === "stderr" ? "_stderrBuffer" : "_stdoutBuffer";
+  task[field] += chunk.toString("utf8");
+  const lines = task[field].split(/\r?\n/);
+  task[field] = lines.pop() || "";
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    task.lastLine = line;
+    parseDoingfbTaskLine(task, line);
+    addDoingfbLog(`[DoingFB] ${line}`);
+  }
+}
+
+async function completeDoingfbRun(task = doingfbRun.task) {
+  if (doingfbRun.endedAt) return;
+  const taskEndedAt = new Date().toISOString();
+  let finalStatus;
+  if (doingfbRun.requestedStop) finalStatus = "stopped";
+  else if (task?.status === "failed") finalStatus = "error";
+  else finalStatus = "completed";
+
+  let autoReviewSummary = null;
+  if (finalStatus === "completed" && doingfbRun.startedAt) {
+    doingfbRun.status = "reviewing";
+    addDoingfbLog("开始自动初审本轮 DoingFB 新增提示词");
+    try {
+      autoReviewSummary = await autoReviewPendingPrompts({
+        reviewer: "auto:doingfb",
+        limit: 10000,
+        sourcePlatform: "doingfb",
+        startedAt: doingfbRun.startedAt,
+        endedAt: taskEndedAt,
+        order: "oldest"
+      });
+      addDoingfbLog(
+        `自动初审完成：扫描 ${autoReviewSummary.scanned}，通过 ${autoReviewSummary.approved}，重复 ${autoReviewSummary.duplicate}，驳回 ${autoReviewSummary.rejected}，清理 ${autoReviewSummary.cleaned}，失败 ${autoReviewSummary.failed}`
+      );
+    } catch (error) {
+      autoReviewSummary = { error: error.message };
+      addDoingfbLog(`自动初审失败：${error.message}`);
+      console.error("Auto review after DoingFB scrape failed:", error);
+    }
+  }
+
+  doingfbRun.endedAt = new Date().toISOString();
+  doingfbRun.status = finalStatus;
+  const counts = await readScrapeCounts().catch(() => null);
+  doingfbRun.finalCounts = counts;
+  doingfbRun.autoReview = autoReviewSummary;
+  doingfbRun.finalDelta = counts && doingfbRun.before
+    ? {
+        raw: counts.rawTotal - doingfbRun.before.rawTotal,
+        doingfb: counts.doingfbTotal - doingfbRun.before.doingfbTotal,
+        creators: counts.creators - doingfbRun.before.creators,
+        cloudImages: counts.cloudImages - doingfbRun.before.cloudImages,
+        approved: counts.approved - doingfbRun.before.approved
+      }
+    : null;
+  addDoingfbLog(`DoingFB 采集${doingfbRun.status === "completed" ? "完成" : doingfbRun.status === "stopped" ? "已停止" : "异常结束"}`);
+}
+
+function spawnDoingfbTask(env) {
+  const task = doingfbRun.task;
+  task.status = "running";
+  task.startedAt = new Date().toISOString();
+  const child = spawn(process.execPath, [path.join(__dirname, "scripts", "scrape-doingfb.js")], {
+    cwd: __dirname,
+    env: { ...process.env, ...env },
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  task._child = child;
+  task.pid = child.pid;
+  addDoingfbLog(`DoingFB 采集已启动，PID ${child.pid}`);
+  child.stdout.on("data", (chunk) => handleDoingfbOutput(task, chunk, "stdout"));
+  child.stderr.on("data", (chunk) => handleDoingfbOutput(task, chunk, "stderr"));
+  child.on("error", (error) => {
+    task.status = "failed";
+    task.errors += 1;
+    task.lastLine = error.message;
+    task.endedAt = new Date().toISOString();
+    addDoingfbLog(`DoingFB 启动失败：${error.message}`);
+    completeDoingfbRun(task).catch((completeError) => console.error("Failed to finalize DoingFB run:", completeError));
+  });
+  child.on("close", (code) => {
+    for (const streamName of ["stdout", "stderr"]) {
+      const field = streamName === "stderr" ? "_stderrBuffer" : "_stdoutBuffer";
+      if (task[field]) handleDoingfbOutput(task, "\n", streamName);
+    }
+    task.exitCode = code;
+    task.endedAt = new Date().toISOString();
+    if (doingfbRun.requestedStop) task.status = "stopped";
+    else task.status = code === 0 ? "completed" : "failed";
+    task._child = null;
+    addDoingfbLog(`DoingFB 进程结束，退出码 ${code}`);
+    completeDoingfbRun(task).catch((error) => console.error("Failed to finalize DoingFB run:", error));
+  });
+}
+
+async function publicDoingfbStatus() {
+  const counts = await readScrapeCounts();
+  const before = doingfbRun.before || counts;
+  return {
+    ok: true,
+    status: doingfbRun.status,
+    runId: doingfbRun.runId,
+    startedAt: doingfbRun.startedAt,
+    endedAt: doingfbRun.endedAt,
+    autoReview: doingfbRun.autoReview,
+    progress: doingfbProgress(),
+    before,
+    counts,
+    delta: {
+      raw: counts.rawTotal - before.rawTotal,
+      doingfb: counts.doingfbTotal - before.doingfbTotal,
+      creators: counts.creators - before.creators,
+      cloudImages: counts.cloudImages - before.cloudImages,
+      approved: counts.approved - before.approved
+    },
+    task: doingfbRun.task ? publicTask(doingfbRun.task) : null,
+    logs: doingfbRun.logs.slice(-40),
+    logPath: doingfbRun.logPath
+  };
+}
+
+async function startDoingfbRun(options = {}) {
+  if (isDoingfbActive()) {
+    const error = new Error("DOINGFB_ALREADY_RUNNING");
+    error.statusCode = 409;
+    throw error;
+  }
+  const before = await readScrapeCounts();
+  resetDoingfbRun(before);
+  addDoingfbLog("DoingFB 手动采集任务已启动");
+  spawnDoingfbTask({
+    ARCHIVE_IMAGES: "1",
+    DOINGFB_MAX_ITEMS: String(Math.max(0, Number(options.maxItems || process.env.UI_DOINGFB_MAX_ITEMS || 0))),
+    DOINGFB_DELAY_MS: process.env.UI_DOINGFB_DELAY_MS || "250",
+    DOINGFB_REQUEST_TIMEOUT_MS: process.env.UI_DOINGFB_REQUEST_TIMEOUT_MS || "30000",
+    IMAGE_ARCHIVE_BATCH_SIZE: process.env.UI_IMAGE_ARCHIVE_BATCH_SIZE || "10"
+  });
+}
+
+async function stopDoingfbRun(message = "正在停止 DoingFB 采集任务") {
+  if (!isDoingfbActive()) return false;
+  if (doingfbRun.status === "stopping") return true;
+  doingfbRun.requestedStop = true;
+  doingfbRun.status = "stopping";
+  addDoingfbLog(message);
+  const task = doingfbRun.task;
+  if (task?._child && ["running", "paused"].includes(task.status)) {
+    await controlProcessTree(task.pid, "resume").catch(() => {});
+    await controlProcessTree(task.pid, "stop").catch(() => {});
+    task.status = "stopped";
+  }
+  completeDoingfbRun(task).catch((error) => console.error("Failed to finalize DoingFB stop:", error));
+  return true;
 }
 
 function scrapeProgress() {
@@ -1904,6 +2149,40 @@ app.post("/api/scrape/start", async (_req, res, next) => {
       res.status(error.statusCode).json({ ok: false, error: error.message });
       return;
     }
+    next(error);
+  }
+});
+
+app.get("/api/doingfb/status", async (_req, res, next) => {
+  try {
+    res.json(await publicDoingfbStatus());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/doingfb/start", async (req, res, next) => {
+  try {
+    await startDoingfbRun({ maxItems: req.body?.maxItems });
+    res.json(await publicDoingfbStatus());
+  } catch (error) {
+    if (error.statusCode) {
+      res.status(error.statusCode).json({ ok: false, error: error.message });
+      return;
+    }
+    next(error);
+  }
+});
+
+app.post("/api/doingfb/stop", async (_req, res, next) => {
+  try {
+    if (!isDoingfbActive()) {
+      res.status(409).json({ ok: false, error: "DOINGFB_NOT_ACTIVE" });
+      return;
+    }
+    await stopDoingfbRun();
+    res.json(await publicDoingfbStatus());
+  } catch (error) {
     next(error);
   }
 });

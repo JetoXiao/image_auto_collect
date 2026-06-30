@@ -343,6 +343,10 @@ h1 {
   margin-top: 10px;
 }
 
+.scrape-tasks.single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .scrape-task {
   min-width: 0;
   border: 1px solid var(--line);
@@ -386,6 +390,10 @@ h1 {
   grid-template-columns: repeat(2, minmax(72px, 1fr));
   gap: 8px;
   min-width: 170px;
+}
+
+.scrape-actions.single-actions {
+  grid-template-columns: minmax(130px, 1fr);
 }
 
 .scrape-log-box {

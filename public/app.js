@@ -36,6 +36,7 @@ const prev = document.querySelector("#prev");
 const next = document.querySelector("#next");
 const pageSize = document.querySelector("#pageSize");
 const pageSelect = document.querySelector("#pageSelect");
+const autoReview = document.querySelector("#autoReview");
 const lightbox = document.querySelector("#lightbox");
 const lightboxImage = document.querySelector("#lightboxImage");
 const lightboxTitle = document.querySelector("#lightboxTitle");
@@ -765,6 +766,9 @@ function renderApprovedPrompts(items) {
         <h2>${escapeHtml(item.title || `Prompt #${item.id}`)}</h2>
         <p>${escapeHtml(item.prompt_preview || "")}</p>
         <div class="approved-tags">${tagList(item.styles)} ${tagList(item.scenes)}</div>
+        <div class="approved-actions">
+          <button class="reject approved-reject" type="button">退回</button>
+        </div>
       </div>
     `;
     card.querySelector("input").addEventListener("change", (event) => {
@@ -776,6 +780,7 @@ function renderApprovedPrompts(items) {
     card.querySelector(".approved-thumb").addEventListener("click", () => {
       if (images.length) openLightbox(images, 0, item.title || item.source_handle || "");
     });
+    card.querySelector(".approved-reject").addEventListener("click", () => rejectApprovedPrompt(item.id));
     approvedList.appendChild(card);
   }
 }
@@ -807,6 +812,16 @@ async function applyBulkCategory() {
   state.approved.selected.clear();
   await Promise.all([loadApprovedPrompts(), loadStats()]);
   window.alert(`已修改 ${data.updated || 0} 条`);
+}
+
+async function rejectApprovedPrompt(id) {
+  await requestJson(`/api/approved-prompts/${id}/reject`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason: "管理员从已通过列表退回" })
+  });
+  state.approved.selected.delete(Number(id));
+  await Promise.all([loadApprovedPrompts(), loadStats()]);
 }
 
 function renderPrompts(items) {
@@ -970,6 +985,28 @@ async function markPending(id) {
   await refresh();
 }
 
+async function runAutoReview() {
+  autoReview.disabled = true;
+  const originalText = autoReview.textContent;
+  autoReview.textContent = "初审中...";
+  try {
+    const data = await requestJson("/api/raw-prompts/auto-review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: state.limit, search: state.search })
+    });
+    await refresh();
+    window.alert(
+      `智能初审完成：扫描 ${data.scanned || 0} 条，通过 ${data.approved || 0} 条，重复 ${data.duplicate || 0} 条，驳回 ${data.rejected || 0} 条，清洗 ${data.cleaned || 0} 条，失败 ${data.failed || 0} 条`
+    );
+  } catch (error) {
+    window.alert(error.message);
+  } finally {
+    autoReview.disabled = false;
+    autoReview.textContent = originalText;
+  }
+}
+
 async function refresh() {
   await Promise.all([loadStats(), loadPrompts()]);
 }
@@ -1028,6 +1065,7 @@ search.addEventListener("input", () => {
 });
 
 document.querySelector("#refresh").addEventListener("click", () => refresh());
+autoReview.addEventListener("click", () => runAutoReview());
 scrapeStart.addEventListener("click", () => scrapeAction("start"));
 scrapePause.addEventListener("click", () => scrapeAction("pause"));
 scrapeResume.addEventListener("click", () => scrapeAction("resume"));

@@ -211,7 +211,7 @@ h1 {
 
 .toolbar {
   display: grid;
-  grid-template-columns: auto minmax(260px, 1fr) auto;
+  grid-template-columns: auto minmax(260px, 1fr) auto auto;
   gap: 12px;
   align-items: center;
   border: 1px solid var(--line);
@@ -823,6 +823,12 @@ h1 {
 
 .approved-tags {
   margin-top: 8px;
+}
+
+.approved-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
 }
 
 .empty {

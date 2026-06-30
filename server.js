@@ -95,9 +95,190 @@ function previewFromPrompt(prompt) {
   return oneLine.length > 260 ? `${oneLine.slice(0, 260)}...` : oneLine;
 }
 
+function cleanPromptText(value) {
+  let text = String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\u00a0/g, " ");
+
+  text = text
+    .replace(/!\[[^\]]*]\([^)]*\)/g, "")
+    .replace(/\[([^\]]+)]\((?:https?:\/\/|www\.)[^)]*\)/gi, "$1")
+    .replace(/(?:https?:\/\/|www\.)[^\s<>"')\]]+/gi, "")
+    .replace(/\bpic\.twitter\.com\/[A-Za-z0-9_/-]+/gi, "")
+    .replace(/<[^>]+>/g, " ");
+
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => {
+      const compact = line.replace(/\s+/g, " ");
+      if (/^(?:source|link|links|more|thread|tweet|x post|original|via|credit|credits|参考|来源|链接|原文|查看|作者)\s*[:：]?$/i.test(compact)) return false;
+      if (/^(?:follow|subscribe|like|retweet|repost|share|bookmark|join|dm|reply|comment)\b/i.test(compact)) return false;
+      if (/^(?:prompt\s+(?:in|below|comments?)|comment\s+for\s+prompt|提示词.*评论区|评论区.*提示词)/i.test(compact)) return false;
+      if (/^[@#][\w.-]+(?:\s+[@#][\w.-]+)*$/i.test(compact)) return false;
+      return true;
+    });
+
+  text = lines.join("\n");
+  text = text
+    .replace(/(^|\n)\s*(?:\d+[\).、]\s*)?(?:prompt|image prompt|提示词|咒语|关键词)\s*(?:structure)?\s*[:：-]\s*/gi, "$1")
+    .replace(/(^|\n)\s*(?:简洁版|完整版)?(?:通用)?提示词\s*[👇:：-]?\s*/gi, "$1")
+    .replace(/\b(?:follow|like|retweet|repost|share|bookmark|subscribe)\b[^.\n。]*[.\n。]?/gi, " ")
+    .replace(/(?:^|\s)@\w{2,30}\b/g, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/^[\s,.;:：，。、-]+|[\s,.;:：，。、-]+$/g, "")
+    .trim();
+
+  return text;
+}
+
 function looksEncodingDamaged(prompt) {
   const questionCount = (prompt.match(/\?/g) || []).length;
   return /\?{6,}/.test(prompt) && questionCount >= 20 && questionCount / Math.max(prompt.length, 1) > 0.15;
+}
+
+const qualityPositivePatterns = [
+  /\b(prompt|image|photo|photograph|portrait|poster|illustration|render|scene|character|composition|camera|lens|lighting|cinematic|realistic|style|background|color|palette|texture|wide shot|close-up|full body)\b/i,
+  /\b(?:midjourney|gpt[-\s]?image|chatgpt|image2|sora|dall[-\s]?e|stable diffusion)\b/i,
+  /\b(?:aspect ratio|ar\s+\d|16:9|9:16|1:1|3:2|4:5|--ar|--style|--sref|--v\s*\d)/i,
+  /[\u4e00-\u9fff].{0,12}(?:画面|镜头|构图|光线|摄影|写实|海报|插画|人物|角色|场景|背景|风格|色彩|材质)/
+];
+
+const qualityNegativePatterns = [
+  /\b(?:giveaway|airdrop|discount|coupon|sale|join my|newsletter|course|tutorial|download|discord|telegram|patreon|gumroad|buy now)\b/i,
+  /\b(?:prompt\s+in\s+(?:comments?|reply|thread)|comment\s+for\s+prompt|rt\s+for\s+prompt)\b/i,
+  /(?:提示词|咒语).{0,16}(?:评论区|回复|转发)/,
+  /(?:评论区|回复|转发).{0,16}(?:提示词|咒语)/,
+  /\b(?:http|www\.|pic\.twitter\.com)\b/i,
+  /access_token|backend-api|rate-limit|stack trace|error:/i
+];
+
+function imageCountFromRow(row) {
+  if (Array.isArray(row.image_urls) && row.image_urls.filter(Boolean).length) {
+    return new Set(row.image_urls.filter(Boolean)).size;
+  }
+  return row.image_url ? 1 : 0;
+}
+
+function classifyAutoReview(row) {
+  const originalPrompt = String(row.prompt || "");
+  const cleanedPrompt = cleanPromptText(originalPrompt);
+  const text = cleanedPrompt || originalPrompt.trim();
+  const reasons = [];
+  let score = 0;
+
+  const imageCount = imageCountFromRow(row);
+  if (imageCount > 0) {
+    score += 3;
+    reasons.push(`has_images:${imageCount}`);
+  } else {
+    score -= 6;
+    reasons.push("no_image");
+  }
+
+  const length = text.length;
+  if (length >= 120) {
+    score += 3;
+    reasons.push("rich_prompt");
+  } else if (length >= 60) {
+    score += 1;
+    reasons.push("usable_length");
+  } else {
+    score -= 4;
+    reasons.push("too_short");
+  }
+
+  const positiveHits = qualityPositivePatterns.filter((pattern) => pattern.test(text)).length;
+  score += positiveHits * 2;
+  if (positiveHits) reasons.push(`visual_signals:${positiveHits}`);
+
+  const negativeHits = qualityNegativePatterns.filter((pattern) => pattern.test(originalPrompt) || pattern.test(cleanedPrompt)).length;
+  score -= negativeHits * 3;
+  if (negativeHits) reasons.push(`noise_signals:${negativeHits}`);
+
+  if (looksEncodingDamaged(text)) {
+    score -= 8;
+    reasons.push("encoding_suspect");
+  }
+
+  const urlCount = (originalPrompt.match(/(?:https?:\/\/|www\.)/gi) || []).length;
+  if (urlCount) reasons.push(`removed_links:${urlCount}`);
+
+  const alphaMatches = text.match(/[A-Za-z]/g) || [];
+  const punctuationMatches = text.match(/[{}[\]|<>]/g) || [];
+  const punctuationRatio = punctuationMatches.length / Math.max(text.length, 1);
+  if (punctuationRatio > 0.08) {
+    score -= 2;
+    reasons.push("high_symbol_noise");
+  }
+
+  if (alphaMatches.length < 12 && !/[\u4e00-\u9fff]/.test(text)) {
+    score -= 3;
+    reasons.push("low_text_signal");
+  }
+
+  const promptChanged = cleanedPrompt !== originalPrompt.trim();
+  const reject = score < 2 || !text || text.length < 45 || imageCount === 0 || looksEncodingDamaged(text);
+  return {
+    action: reject ? "reject" : "approve",
+    score,
+    reasons,
+    cleanedPrompt: text,
+    promptChanged,
+    originalLength: originalPrompt.trim().length,
+    cleanedLength: text.length
+  };
+}
+
+async function approveRawPromptWithClient(client, id, reviewer) {
+  const approval = await client.query(
+    `WITH src AS (
+       SELECT * FROM raw_prompt_templates WHERE id = $1
+     ),
+     inserted AS (
+       INSERT INTO approved_prompt_templates
+        (raw_prompt_id, creator_id, source_platform, source_handle, source_url, source_tweet_id,
+         title, original_image_url, original_image_urls, image_url, image_urls, image_alt,
+         prompt, prompt_preview, category, styles, scenes, metadata, source_published_at, approved_by)
+       SELECT
+        id, creator_id, source_platform, source_handle, source_url, source_tweet_id,
+        title, original_image_url, original_image_urls, image_url, image_urls, image_alt,
+        prompt, prompt_preview, category, styles, scenes, metadata, source_published_at, $2
+       FROM src
+       ON CONFLICT DO NOTHING
+       RETURNING id, false AS duplicate
+     )
+     SELECT id, duplicate FROM inserted
+     UNION ALL
+     SELECT approved_prompt_templates.id, true AS duplicate
+     FROM approved_prompt_templates, src
+     WHERE approved_prompt_templates.prompt_hash = src.prompt_hash
+        OR (
+          src.source_url IS NOT NULL
+          AND src.source_url <> ''
+          AND approved_prompt_templates.source_url = src.source_url
+          AND approved_prompt_templates.prompt_hash = src.prompt_hash
+        )
+     LIMIT 1`,
+    [id, reviewer]
+  );
+
+  const approvedId = approval.rows[0]?.id;
+  const duplicate = approval.rows[0]?.duplicate === true;
+  await client.query(
+    `UPDATE raw_prompt_templates
+     SET review_status = $2,
+         reviewed_by = $3,
+         reviewed_at = now(),
+         reject_reason = NULL,
+         approved_template_id = $4
+     WHERE id = $1`,
+    [id, duplicate ? "duplicate" : "approved", reviewer, approvedId || null]
+  );
+  return { approvedId, duplicate };
 }
 
 function hashPassword(password, salt = randomBytes(16).toString("hex")) {
@@ -1375,6 +1556,52 @@ app.patch("/api/approved-prompts/category", async (req, res, next) => {
   }
 });
 
+app.post("/api/approved-prompts/:id/reject", async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ ok: false, error: "INVALID_ID" });
+      return;
+    }
+    const reviewer = req.user?.username || "unknown";
+    const reason = String(req.body?.reason || "approved_prompt_rejected").slice(0, 500);
+    await client.query("BEGIN");
+    const approved = await client.query("SELECT * FROM approved_prompt_templates WHERE id = $1 FOR UPDATE", [id]);
+    if (!approved.rowCount) {
+      await client.query("ROLLBACK");
+      res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      return;
+    }
+    const row = approved.rows[0];
+    await client.query(
+      `UPDATE raw_prompt_templates
+       SET review_status = 'rejected',
+           reviewed_by = $2,
+           reviewed_at = now(),
+           reject_reason = $3,
+           approved_template_id = NULL,
+           metadata = jsonb_set(
+             jsonb_set(metadata, '{approvedRejectBy}', to_jsonb($2::text), true),
+             '{approvedRejectAt}',
+             to_jsonb(now()::text),
+             true
+           )
+       WHERE approved_template_id = $1
+          OR id = $4`,
+      [id, reviewer, reason, row.raw_prompt_id || 0]
+    );
+    await client.query("DELETE FROM approved_prompt_templates WHERE id = $1", [id]);
+    await client.query("COMMIT");
+    res.json({ ok: true, id, rawPromptId: row.raw_prompt_id || null });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    next(error);
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/scrape/status", async (_req, res, next) => {
   try {
     res.json(await publicScrapeStatus());
@@ -1612,7 +1839,7 @@ app.patch("/api/raw-prompts/:id", async (req, res, next) => {
       return;
     }
 
-    const prompt = String(req.body?.prompt || "").trim();
+    const prompt = cleanPromptText(req.body?.prompt || "");
     if (!prompt) {
       res.status(400).json({ ok: false, error: "PROMPT_REQUIRED" });
       return;
@@ -1648,6 +1875,130 @@ app.patch("/api/raw-prompts/:id", async (req, res, next) => {
   }
 });
 
+app.post("/api/raw-prompts/auto-review", async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    const reviewer = req.user?.username || "unknown";
+    const limit = Math.min(500, Math.max(1, Math.floor(Number(req.body?.limit || 100))));
+    const search = String(req.body?.search || "").trim();
+    const values = [];
+    const clauses = ["review_status = 'pending'"];
+    if (search) {
+      values.push(`%${search}%`);
+      clauses.push(`(
+        title ILIKE $${values.length}
+        OR prompt ILIKE $${values.length}
+        OR prompt_preview ILIKE $${values.length}
+        OR category ILIKE $${values.length}
+        OR source_handle ILIKE $${values.length}
+      )`);
+    }
+    values.push(limit);
+
+    const candidates = await pool.query(
+      `SELECT *
+       FROM raw_prompt_templates
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY scraped_at ASC, id ASC
+       LIMIT $${values.length}`,
+      values
+    );
+
+    const summary = {
+      scanned: candidates.rowCount,
+      approved: 0,
+      duplicate: 0,
+      rejected: 0,
+      cleaned: 0,
+      failed: 0,
+      samples: []
+    };
+
+    for (const row of candidates.rows) {
+      const review = classifyAutoReview(row);
+      try {
+        await client.query("BEGIN");
+        const locked = await client.query("SELECT * FROM raw_prompt_templates WHERE id = $1 FOR UPDATE", [row.id]);
+        if (!locked.rowCount || locked.rows[0].review_status !== "pending") {
+          await client.query("ROLLBACK");
+          continue;
+        }
+        const currentReview = classifyAutoReview(locked.rows[0]);
+        const prompt = currentReview.cleanedPrompt;
+        if (prompt !== locked.rows[0].prompt) summary.cleaned += 1;
+
+        const autoReviewJson = {
+          action: currentReview.action,
+          score: currentReview.score,
+          reasons: currentReview.reasons,
+          promptChanged: currentReview.promptChanged,
+          originalLength: currentReview.originalLength,
+          cleanedLength: currentReview.cleanedLength,
+          reviewer,
+          reviewedAt: new Date().toISOString(),
+          version: 1
+        };
+
+        if (currentReview.action === "approve") {
+          await client.query(
+            `UPDATE raw_prompt_templates
+             SET prompt = $2,
+                 prompt_preview = $3,
+                 metadata = jsonb_set(metadata, '{autoReview}', $4::jsonb, true)
+             WHERE id = $1`,
+            [row.id, prompt, previewFromPrompt(prompt), JSON.stringify(autoReviewJson)]
+          );
+          const approved = await approveRawPromptWithClient(client, row.id, `auto:${reviewer}`);
+          if (approved.duplicate) summary.duplicate += 1;
+          else summary.approved += 1;
+        } else {
+          await client.query(
+            `UPDATE raw_prompt_templates
+             SET prompt = $2,
+                 prompt_preview = $3,
+                 review_status = 'rejected',
+                 reviewed_by = $4,
+                 reviewed_at = now(),
+                 reject_reason = $5,
+                 approved_template_id = NULL,
+                 metadata = jsonb_set(metadata, '{autoReview}', $6::jsonb, true)
+             WHERE id = $1`,
+            [
+              row.id,
+              prompt,
+              previewFromPrompt(prompt),
+              `auto:${reviewer}`,
+              currentReview.reasons.join(", ").slice(0, 500),
+              JSON.stringify(autoReviewJson)
+            ]
+          );
+          summary.rejected += 1;
+        }
+        await client.query("COMMIT");
+        if (summary.samples.length < 12) {
+          summary.samples.push({
+            id: row.id,
+            action: currentReview.action,
+            score: currentReview.score,
+            reasons: currentReview.reasons,
+            title: row.title || previewFromPrompt(prompt)
+          });
+        }
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        summary.failed += 1;
+        console.error(`Auto review failed for raw prompt ${row.id}:`, error);
+      }
+    }
+
+    res.json({ ok: true, ...summary });
+  } catch (error) {
+    next(error);
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/api/raw-prompts/:id/approve", async (req, res, next) => {
   const client = await pool.connect();
   try {
@@ -1665,51 +2016,29 @@ app.post("/api/raw-prompts/:id/approve", async (req, res, next) => {
       res.status(404).json({ ok: false, error: "NOT_FOUND" });
       return;
     }
+    const cleanedPrompt = cleanPromptText(raw.rows[0].prompt);
+    if (!cleanedPrompt || looksEncodingDamaged(cleanedPrompt)) {
+      await client.query("ROLLBACK");
+      res.status(400).json({ ok: false, error: "PROMPT_QUALITY_FAILED" });
+      return;
+    }
+    if (cleanedPrompt !== raw.rows[0].prompt) {
+      await client.query(
+        `UPDATE raw_prompt_templates
+         SET prompt = $2,
+             prompt_preview = $3,
+             metadata = jsonb_set(
+               jsonb_set(metadata, '{cleanedPromptBy}', to_jsonb($4::text), true),
+               '{cleanedPromptAt}',
+               to_jsonb(now()::text),
+               true
+             )
+         WHERE id = $1`,
+        [id, cleanedPrompt, previewFromPrompt(cleanedPrompt), reviewer]
+      );
+    }
 
-    const approval = await client.query(
-      `WITH src AS (
-         SELECT * FROM raw_prompt_templates WHERE id = $1
-       ),
-       inserted AS (
-         INSERT INTO approved_prompt_templates
-          (raw_prompt_id, creator_id, source_platform, source_handle, source_url, source_tweet_id,
-           title, original_image_url, original_image_urls, image_url, image_urls, image_alt,
-           prompt, prompt_preview, category, styles, scenes, metadata, source_published_at, approved_by)
-         SELECT
-          id, creator_id, source_platform, source_handle, source_url, source_tweet_id,
-          title, original_image_url, original_image_urls, image_url, image_urls, image_alt,
-          prompt, prompt_preview, category, styles, scenes, metadata, source_published_at, $2
-         FROM src
-         ON CONFLICT DO NOTHING
-         RETURNING id, false AS duplicate
-       )
-       SELECT id, duplicate FROM inserted
-       UNION ALL
-       SELECT approved_prompt_templates.id, true AS duplicate
-       FROM approved_prompt_templates, src
-       WHERE approved_prompt_templates.prompt_hash = src.prompt_hash
-          OR (
-            src.source_url IS NOT NULL
-            AND src.source_url <> ''
-            AND approved_prompt_templates.source_url = src.source_url
-            AND approved_prompt_templates.prompt_hash = src.prompt_hash
-          )
-       LIMIT 1`,
-      [id, reviewer]
-    );
-
-    const approvedId = approval.rows[0]?.id;
-    const duplicate = approval.rows[0]?.duplicate === true;
-    await client.query(
-      `UPDATE raw_prompt_templates
-       SET review_status = $2,
-           reviewed_by = $3,
-           reviewed_at = now(),
-           reject_reason = NULL,
-           approved_template_id = $4
-       WHERE id = $1`,
-      [id, duplicate ? "duplicate" : "approved", reviewer, approvedId || null]
-    );
+    const { approvedId, duplicate } = await approveRawPromptWithClient(client, id, reviewer);
     await client.query("COMMIT");
     res.json({ ok: true, approvedTemplateId: approvedId, duplicate });
   } catch (error) {

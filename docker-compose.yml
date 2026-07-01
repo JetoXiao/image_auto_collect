@@ -24,6 +24,8 @@ services:
       IMAGE_ARCHIVE_MODE: local
       IMAGE_ARCHIVE_ROOT: /data/image-auto-collect/images
       IMAGE_PUBLIC_BASE: https://useaifor.me/prompt-images
+      AWESOME_MEDIA_ROOT: ${AWESOME_MEDIA_ROOT:-/awesome-image2-uploads}
+      AWESOME_MEDIA_PREFIX: ${AWESOME_MEDIA_PREFIX:-image-auto-collect}
       UI_SCRAPE_MAX_CREATORS: "500"
       UI_SCRAPE_MAX_ITEMS_PER_CREATOR: "25"
     ports:
@@ -32,6 +34,7 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - /data/image-auto-collect/images:/data/image-auto-collect/images
+      - ${AWESOME_MEDIA_HOST_ROOT:-/var/lib/docker/volumes/awesome-image2_app-uploads/_data}:/awesome-image2-uploads
     secrets:
       - postgres_password
     networks:

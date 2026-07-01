@@ -1,4 +1,6 @@
 import pg from "pg";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { createPool } from "./db.js";
 
 const { Pool } = pg;
@@ -10,11 +12,21 @@ const syncAll = args.includes("--all");
 const retryFailed = process.env.SYNC_RETRY_FAILED !== "0";
 const batchSize = readNumberArg("--limit", Number(process.env.SYNC_BATCH_SIZE || 200));
 const categoryBatchSize = readNumberArg("--category-limit", Number(process.env.SYNC_CATEGORY_BATCH_SIZE || 100));
+const imageArchiveRoot = process.env.IMAGE_ARCHIVE_ROOT || "/data/image-auto-collect/images";
+const imagePublicBase = process.env.IMAGE_PUBLIC_BASE || "https://useaifor.me/prompt-images";
+const awesomeMediaRoot = process.env.AWESOME_MEDIA_ROOT || "";
+const awesomeMediaPrefix = cleanObjectKeySegment(process.env.AWESOME_MEDIA_PREFIX || "image-auto-collect");
 
 function readNumberArg(name, fallback) {
   const prefix = `${name}=`;
-  const match = args.find((arg) => arg.startsWith(prefix));
-  const value = match ? Number(match.slice(prefix.length)) : fallback;
+  const equalsMatch = args.find((arg) => arg.startsWith(prefix));
+  const spacedIndex = args.findIndex((arg) => arg === name);
+  const rawValue = equalsMatch
+    ? equalsMatch.slice(prefix.length)
+    : spacedIndex !== -1
+      ? args[spacedIndex + 1]
+      : null;
+  const value = rawValue ? Number(rawValue) : fallback;
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
@@ -43,7 +55,7 @@ function syncStatuses() {
 
 function imageMimeType(url) {
   try {
-    const pathname = new URL(url).pathname.toLowerCase();
+    const pathname = (String(url).startsWith("http") ? new URL(url).pathname : String(url)).toLowerCase();
     if (pathname.endsWith(".png")) return "image/png";
     if (pathname.endsWith(".webp")) return "image/webp";
     if (pathname.endsWith(".gif")) return "image/gif";
@@ -52,6 +64,88 @@ function imageMimeType(url) {
     // Fall through to the target app's common case.
   }
   return "image/jpeg";
+}
+
+function cleanObjectKeySegment(value) {
+  return String(value || "")
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((segment) => segment.replace(/[^A-Za-z0-9._-]+/g, "_"))
+    .filter(Boolean)
+    .join("/");
+}
+
+function encodeObjectKey(objectKey) {
+  return objectKey.split("/").map(encodeURIComponent).join("/");
+}
+
+function archiveRelativePathFromPublicUrl(value) {
+  let url;
+  let publicBase;
+  try {
+    url = new URL(String(value || ""));
+    publicBase = new URL(imagePublicBase);
+  } catch {
+    return null;
+  }
+
+  const basePath = publicBase.pathname.replace(/\/+$/g, "");
+  if (url.hostname !== publicBase.hostname || !url.pathname.startsWith(`${basePath}/`)) {
+    return null;
+  }
+
+  const relative = url.pathname.slice(basePath.length + 1);
+  return relative
+    .split("/")
+    .map((segment) => decodeURIComponent(segment))
+    .filter(Boolean)
+    .join("/");
+}
+
+function safeResolve(root, relativePath) {
+  const rootPath = path.resolve(root);
+  const filePath = path.resolve(rootPath, relativePath);
+  if (filePath !== rootPath && !filePath.startsWith(`${rootPath}${path.sep}`)) {
+    throw new Error("AWESOME_MEDIA_PATH_ESCAPE");
+  }
+  return filePath;
+}
+
+async function copyFileIfNeeded(sourcePath, targetPath) {
+  const [sourceStat, targetStat] = await Promise.all([
+    fs.stat(sourcePath),
+    fs.stat(targetPath).catch(() => null)
+  ]);
+  if (targetStat && targetStat.size === sourceStat.size) return false;
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.copyFile(sourcePath, targetPath);
+  return true;
+}
+
+async function prepareAwesomeMedia(url) {
+  const archiveRelativePath = archiveRelativePathFromPublicUrl(url);
+  if (!archiveRelativePath || !awesomeMediaRoot) {
+    return {
+      objectKey: url,
+      publicUrl: url,
+      mimeType: imageMimeType(url),
+      copied: false,
+      local: false
+    };
+  }
+
+  const objectKey = `${awesomeMediaPrefix}/${archiveRelativePath}`;
+  const sourcePath = safeResolve(imageArchiveRoot, archiveRelativePath);
+  const targetPath = safeResolve(awesomeMediaRoot, objectKey);
+  await copyFileIfNeeded(sourcePath, targetPath);
+  return {
+    objectKey,
+    publicUrl: `/api/media/${encodeObjectKey(objectKey)}`,
+    mimeType: imageMimeType(objectKey),
+    copied: true,
+    local: true
+  };
 }
 
 function cleanText(value, fallback = "") {
@@ -290,10 +384,11 @@ async function upsertPrompt(target, row) {
     for (const [index, url] of urls.entries()) {
       const assetId = `iac_asset_${row.approved_prompt_id}_${index + 1}`;
       const promptImageId = `${imagePrefix}${index + 1}`;
+      const media = await prepareAwesomeMedia(url);
       await target.query(
         `INSERT INTO "Asset"
           ("id", "kind", "provider", "objectKey", "publicUrl", "mimeType", "sizeBytes", "createdAt", "updatedAt")
-         VALUES ($1, 'PROMPT_EXAMPLE', 'LOCAL', $2, $2, $3, 0, now(), now())
+         VALUES ($1, 'PROMPT_EXAMPLE', 'LOCAL', $2, $3, $4, 0, now(), now())
          ON CONFLICT ("id") DO UPDATE
          SET "kind" = 'PROMPT_EXAMPLE',
              "provider" = 'LOCAL',
@@ -301,7 +396,7 @@ async function upsertPrompt(target, row) {
              "publicUrl" = EXCLUDED."publicUrl",
              "mimeType" = EXCLUDED."mimeType",
              "updatedAt" = now()`,
-        [assetId, url, imageMimeType(url)]
+        [assetId, media.objectKey, media.publicUrl, media.mimeType]
       );
 
       await target.query(

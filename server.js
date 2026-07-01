@@ -1480,34 +1480,49 @@ async function queueAllApprovedForAwesomeSync(createdBy = "system") {
            updated_at = now()`,
       [awesomeTargetSystem]
     );
-    const result = await client.query(
-      `INSERT INTO prompt_sync_events
-         (target_system, event_type, approved_prompt_id, raw_prompt_id, target_prompt_id,
-          target_slug, snapshot, created_by)
-       SELECT
-         $1,
-         'upsert',
+    const rows = await client.query(
+      `SELECT
          approved.id,
          approved.raw_prompt_id,
-         COALESCE(sync.target_prompt_id, 'iac_prompt_' || approved.id::text),
-         COALESCE(sync.target_slug, 'image-auto-' || approved.id::text),
-         jsonb_build_object(
-           'reason', 'manual_requeue_all',
-           'approvedPromptId', approved.id,
-           'promptHash', approved.prompt_hash,
-           'category', approved.category,
-           'requestedBy', $2
-         ),
-         $2::text
+         approved.prompt_hash,
+         approved.category,
+         COALESCE(sync.target_prompt_id, 'iac_prompt_' || approved.id::text) AS target_prompt_id,
+         COALESCE(sync.target_slug, 'image-auto-' || approved.id::text) AS target_slug
        FROM approved_prompt_templates approved
        LEFT JOIN approved_prompt_syncs sync
          ON sync.approved_prompt_id = approved.id
-        AND sync.target_system = $1
-       RETURNING id`,
-      [awesomeTargetSystem, createdBy]
+        AND sync.target_system = $1`,
+      [awesomeTargetSystem]
     );
+    let queued = 0;
+    for (const row of rows.rows) {
+      const event = await client.query(
+        `INSERT INTO prompt_sync_events
+           (target_system, event_type, approved_prompt_id, raw_prompt_id, target_prompt_id,
+            target_slug, snapshot, created_by)
+         VALUES ($1, 'upsert', $2, $3, $4, $5, $6::jsonb, $7::text)
+         ON CONFLICT (event_key) DO NOTHING
+         RETURNING id`,
+        [
+          awesomeTargetSystem,
+          row.id,
+          row.raw_prompt_id,
+          row.target_prompt_id,
+          row.target_slug,
+          JSON.stringify({
+            reason: "manual_requeue_all",
+            approvedPromptId: row.id,
+            promptHash: row.prompt_hash,
+            category: row.category,
+            requestedBy: createdBy
+          }),
+          createdBy
+        ]
+      );
+      if (event.rowCount) queued += 1;
+    }
     await client.query("COMMIT");
-    return result.rowCount;
+    return queued;
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     throw error;

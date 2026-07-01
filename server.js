@@ -705,18 +705,24 @@ async function approveRawPromptWithClient(client, id, reviewer) {
       `INSERT INTO approved_prompt_syncs
          (approved_prompt_id, target_system, target_prompt_id, target_slug, sync_status, sync_payload)
        VALUES (
-         $1,
+         $1::bigint,
          $2,
-         'iac_prompt_' || $1::text,
-         'image-auto-' || $1::text,
+         $3,
+         $4,
          'pending',
-         jsonb_build_object('source', 'auto-approval', 'reviewer', $3)
+         jsonb_build_object('source', 'auto-approval', 'reviewer', $5)
        )
        ON CONFLICT (approved_prompt_id, target_system) DO UPDATE
        SET sync_status = 'pending',
            sync_error = NULL,
            updated_at = now()`,
-      [approvedId, awesomeTargetSystem, reviewer]
+      [
+        approvedId,
+        awesomeTargetSystem,
+        targetPromptIdForApproved(approvedId),
+        targetSlugForApproved(approvedId),
+        reviewer
+      ]
     );
     await queuePromptSyncEvent(client, {
       approvedPromptId: approvedId,

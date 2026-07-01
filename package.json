@@ -12,6 +12,7 @@
     "scrape:prompts": "node scripts/scrape-twitter-rss.js",
     "scrape:doingfb": "node scripts/scrape-doingfb.js",
     "scrape": "node scripts/scrape-twitter-rss.js",
+    "sync:awesome": "node scripts/sync-awesome-image2.js",
     "start": "node server.js"
   },
   "dependencies": {

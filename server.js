@@ -80,16 +80,100 @@ function publicCategory(row) {
     id: row.id,
     value: row.name,
     aliases: row.aliases || [],
+    targetCategoryName: row.target_category_name || row.name,
+    syncStatus: row.sync_status || "pending",
+    syncRevision: Number(row.sync_revision || 0),
+    lastSyncedAt: row.last_synced_at || null,
+    syncError: row.sync_error || null,
     sortOrder: row.sort_order ?? 0
   };
 }
 
 async function loadCategoriesFromDb() {
   const result = await pool.query(
-    "SELECT id, name, aliases, sort_order FROM prompt_categories ORDER BY sort_order ASC, id ASC"
+    `SELECT id, name, aliases, target_category_name, sync_status, sync_revision,
+            last_synced_at, sync_error, sort_order
+     FROM prompt_categories
+     ORDER BY sort_order ASC, id ASC`
   );
   categoryOptions = result.rows.map(publicCategory);
   return categoryOptions;
+}
+
+const awesomeTargetSystem = "awesome-image2-web";
+
+async function queueApprovedPromptSyncs(client, ids) {
+  const cleanIds = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
+  if (!cleanIds.length) return 0;
+  const result = await client.query(
+    `INSERT INTO approved_prompt_syncs
+       (approved_prompt_id, target_system, target_prompt_id, target_slug, sync_status)
+     SELECT approved.id,
+            $2,
+            'iac_prompt_' || approved.id::text,
+            'image-auto-' || approved.id::text,
+            'pending'
+     FROM approved_prompt_templates approved
+     WHERE approved.id = ANY($1::bigint[])
+     ON CONFLICT (approved_prompt_id, target_system) DO UPDATE
+     SET sync_status = 'pending',
+         sync_error = NULL,
+         target_prompt_id = COALESCE(approved_prompt_syncs.target_prompt_id, EXCLUDED.target_prompt_id),
+         target_slug = COALESCE(approved_prompt_syncs.target_slug, EXCLUDED.target_slug),
+         updated_at = now()
+     RETURNING id`,
+    [cleanIds, awesomeTargetSystem]
+  );
+  return result.rowCount;
+}
+
+async function queueApprovedPromptSyncsByCategoryNames(client, categoryNames) {
+  const names = [...new Set((categoryNames || []).map((value) => String(value || "").trim()).filter(Boolean))];
+  if (!names.length) return 0;
+  const result = await client.query(
+    `INSERT INTO approved_prompt_syncs
+       (approved_prompt_id, target_system, target_prompt_id, target_slug, sync_status)
+     SELECT approved.id,
+            $2,
+            'iac_prompt_' || approved.id::text,
+            'image-auto-' || approved.id::text,
+            'pending'
+     FROM approved_prompt_templates approved
+     WHERE approved.category = ANY($1::text[])
+     ON CONFLICT (approved_prompt_id, target_system) DO UPDATE
+     SET sync_status = 'pending',
+         sync_error = NULL,
+         target_prompt_id = COALESCE(approved_prompt_syncs.target_prompt_id, EXCLUDED.target_prompt_id),
+         target_slug = COALESCE(approved_prompt_syncs.target_slug, EXCLUDED.target_slug),
+         updated_at = now()
+     RETURNING id`,
+    [names, awesomeTargetSystem]
+  );
+  return result.rowCount;
+}
+
+async function queueCategorySyncEvent(client, event) {
+  const newName = cleanCategoryName(event.newName);
+  if (!newName) return null;
+  const result = await client.query(
+    `INSERT INTO prompt_category_sync_events
+       (category_id, target_system, event_type, old_name, new_name,
+        old_target_category_name, new_target_category_name, payload, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+     RETURNING id`,
+    [
+      event.categoryId || null,
+      awesomeTargetSystem,
+      event.eventType || "update",
+      event.oldName || null,
+      newName,
+      event.oldTargetCategoryName || event.oldName || null,
+      event.newTargetCategoryName || newName,
+      JSON.stringify(event.payload || {}),
+      event.createdBy || null
+    ]
+  );
+  return result.rows[0]?.id || null;
 }
 
 function previewFromPrompt(prompt) {
@@ -464,7 +548,7 @@ async function approveRawPromptWithClient(client, id, reviewer) {
         title, original_image_url, original_image_urls, image_url, image_urls, image_alt,
         prompt, prompt_preview, category, styles, scenes, metadata, source_published_at, $2
        FROM src
-       ON CONFLICT DO NOTHING
+       ON CONFLICT (prompt_hash) DO NOTHING
        RETURNING id, false AS duplicate
      )
      SELECT id, duplicate FROM inserted
@@ -475,9 +559,9 @@ async function approveRawPromptWithClient(client, id, reviewer) {
         OR (
           src.source_url IS NOT NULL
           AND src.source_url <> ''
-          AND approved_prompt_templates.source_url = src.source_url
-          AND approved_prompt_templates.prompt_hash = src.prompt_hash
-        )
+         AND approved_prompt_templates.source_url = src.source_url
+         AND approved_prompt_templates.prompt_hash = src.prompt_hash
+     )
      LIMIT 1`,
     [id, reviewer]
   );
@@ -494,6 +578,25 @@ async function approveRawPromptWithClient(client, id, reviewer) {
      WHERE id = $1`,
     [id, duplicate ? "duplicate" : "approved", reviewer, approvedId || null]
   );
+  if (approvedId) {
+    await client.query(
+      `INSERT INTO approved_prompt_syncs
+         (approved_prompt_id, target_system, target_prompt_id, target_slug, sync_status, sync_payload)
+       VALUES (
+         $1,
+         $2,
+         'iac_prompt_' || $1::text,
+         'image-auto-' || $1::text,
+         'pending',
+         jsonb_build_object('source', 'auto-approval', 'reviewer', $3)
+       )
+       ON CONFLICT (approved_prompt_id, target_system) DO UPDATE
+       SET sync_status = 'pending',
+           sync_error = NULL,
+           updated_at = now()`,
+      [approvedId, awesomeTargetSystem, reviewer]
+    );
+  }
   return { approvedId, duplicate };
 }
 
@@ -624,28 +727,102 @@ async function ensureAuthTables() {
       id BIGSERIAL PRIMARY KEY,
       name TEXT NOT NULL UNIQUE,
       aliases TEXT[] NOT NULL DEFAULT '{}',
+      sync_key TEXT,
+      target_category_name TEXT,
+      sync_status TEXT NOT NULL DEFAULT 'pending',
+      sync_revision BIGINT NOT NULL DEFAULT 0,
+      last_synced_at TIMESTAMPTZ,
+      sync_error TEXT,
+      sync_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
       sort_order INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
+    CREATE TABLE IF NOT EXISTS prompt_category_sync_events (
+      id BIGSERIAL PRIMARY KEY,
+      category_id BIGINT REFERENCES prompt_categories(id) ON DELETE SET NULL,
+      target_system TEXT NOT NULL DEFAULT 'awesome-image2-web',
+      event_type TEXT NOT NULL,
+      old_name TEXT,
+      new_name TEXT NOT NULL,
+      old_target_category_name TEXT,
+      new_target_category_name TEXT NOT NULL,
+      sync_status TEXT NOT NULL DEFAULT 'pending',
+      sync_error TEXT,
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      processed_at TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS approved_prompt_syncs (
+      id BIGSERIAL PRIMARY KEY,
+      approved_prompt_id BIGINT NOT NULL REFERENCES approved_prompt_templates(id) ON DELETE CASCADE,
+      target_system TEXT NOT NULL DEFAULT 'awesome-image2-web',
+      target_prompt_id TEXT,
+      target_slug TEXT,
+      sync_status TEXT NOT NULL DEFAULT 'pending',
+      sync_error TEXT,
+      sync_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      last_synced_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (approved_prompt_id, target_system),
+      UNIQUE (target_system, target_prompt_id)
+    );
+
+    ALTER TABLE prompt_categories
+      ADD COLUMN IF NOT EXISTS sync_key TEXT,
+      ADD COLUMN IF NOT EXISTS target_category_name TEXT,
+      ADD COLUMN IF NOT EXISTS sync_status TEXT NOT NULL DEFAULT 'pending',
+      ADD COLUMN IF NOT EXISTS sync_revision BIGINT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS sync_error TEXT,
+      ADD COLUMN IF NOT EXISTS sync_metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+    UPDATE prompt_categories
+    SET sync_key = 'category:' || id::text
+    WHERE sync_key IS NULL OR sync_key = '';
+
+    UPDATE prompt_categories
+    SET target_category_name = name
+    WHERE target_category_name IS NULL OR target_category_name = '';
+
+    ALTER TABLE prompt_categories
+      ALTER COLUMN sync_key SET NOT NULL,
+      ALTER COLUMN target_category_name SET NOT NULL;
+
     CREATE INDEX IF NOT EXISTS idx_app_sessions_expires_at ON app_sessions(expires_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_categories_sync_key ON prompt_categories(sync_key);
+    CREATE INDEX IF NOT EXISTS idx_prompt_categories_sync_status ON prompt_categories(sync_status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_prompt_category_sync_events_status ON prompt_category_sync_events(target_system, sync_status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_approved_prompt_syncs_status ON approved_prompt_syncs(target_system, sync_status, updated_at);
   `);
 
   for (const [index, category] of defaultCategoryOptions.entries()) {
     await pool.query(
-      `INSERT INTO prompt_categories (name, aliases, sort_order)
-       VALUES ($1, $2, $3)
+      `INSERT INTO prompt_categories (name, aliases, sync_key, target_category_name, sort_order)
+       VALUES ($1, $2, $3, $1, $4)
        ON CONFLICT (name) DO UPDATE
        SET aliases = EXCLUDED.aliases,
+           target_category_name = COALESCE(prompt_categories.target_category_name, EXCLUDED.target_category_name),
            sort_order = CASE
              WHEN prompt_categories.sort_order = 0 THEN EXCLUDED.sort_order
              ELSE prompt_categories.sort_order
            END,
            updated_at = now()`,
-      [category.value, category.aliases, (index + 1) * 10]
+      [category.value, category.aliases, `category:seed:${index + 1}`, (index + 1) * 10]
     );
   }
+
+  await pool.query(
+    `INSERT INTO approved_prompt_syncs (approved_prompt_id, target_system, target_prompt_id, target_slug)
+     SELECT id, $1, 'iac_prompt_' || id::text, 'image-auto-' || id::text
+     FROM approved_prompt_templates
+     ON CONFLICT (approved_prompt_id, target_system) DO NOTHING`,
+    [awesomeTargetSystem]
+  );
 
   const defaultUsers = ["yuqi", "jeto", "gugg", "felix"];
   for (const username of defaultUsers) {
@@ -1944,26 +2121,49 @@ app.get("/api/categories", async (_req, res, next) => {
 });
 
 app.post("/api/categories", async (req, res, next) => {
+  const client = await pool.connect();
   try {
+    const reviewer = req.user?.username || "unknown";
     const name = cleanCategoryName(req.body?.name);
     if (!name) {
       res.status(400).json({ ok: false, error: "CATEGORY_NAME_REQUIRED" });
       return;
     }
-    const maxOrder = await pool.query("SELECT COALESCE(max(sort_order), 0)::int AS sort_order FROM prompt_categories");
-    const result = await pool.query(
-      `INSERT INTO prompt_categories (name, aliases, sort_order)
-       VALUES ($1, '{}', $2)
-       RETURNING id, name, aliases, sort_order`,
-      [name, (maxOrder.rows[0]?.sort_order || 0) + 10]
+    await client.query("BEGIN");
+    const maxOrder = await client.query("SELECT COALESCE(max(sort_order), 0)::int AS sort_order FROM prompt_categories");
+    const provisionalSyncKey = `category:new:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const result = await client.query(
+      `INSERT INTO prompt_categories (name, aliases, sync_key, target_category_name, sync_status, sync_revision, sort_order)
+       VALUES ($1, '{}', $2, $1, 'pending', 1, $3)
+       RETURNING id, name, aliases, target_category_name, sync_status, sync_revision,
+                 last_synced_at, sync_error, sort_order`,
+      [name, provisionalSyncKey, (maxOrder.rows[0]?.sort_order || 0) + 10]
     );
+    const categoryId = result.rows[0].id;
+    await client.query(
+      `UPDATE prompt_categories
+       SET sync_key = $2
+       WHERE id = $1 AND sync_key = $3`,
+      [categoryId, `category:${categoryId}`, provisionalSyncKey]
+    );
+    await queueCategorySyncEvent(client, {
+      categoryId,
+      eventType: "create",
+      newName: name,
+      newTargetCategoryName: name,
+      createdBy: reviewer
+    });
+    await client.query("COMMIT");
     res.json({ ok: true, item: publicCategory(result.rows[0]), categories: await loadCategoriesFromDb() });
   } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
     if (error.code === "23505") {
       res.status(409).json({ ok: false, error: "CATEGORY_EXISTS" });
       return;
     }
     next(error);
+  } finally {
+    client.release();
   }
 });
 
@@ -1977,7 +2177,10 @@ app.patch("/api/categories/:id", async (req, res, next) => {
       return;
     }
     await client.query("BEGIN");
-    const current = await client.query("SELECT id, name, aliases FROM prompt_categories WHERE id = $1 FOR UPDATE", [id]);
+    const current = await client.query(
+      "SELECT id, name, aliases, target_category_name FROM prompt_categories WHERE id = $1 FOR UPDATE",
+      [id]
+    );
     if (!current.rowCount) {
       await client.query("ROLLBACK");
       res.status(404).json({ ok: false, error: "CATEGORY_NOT_FOUND" });
@@ -1985,17 +2188,41 @@ app.patch("/api/categories/:id", async (req, res, next) => {
     }
     const oldName = current.rows[0].name;
     const aliases = current.rows[0].aliases || [];
+    const oldTargetCategoryName = current.rows[0].target_category_name || oldName;
+    if (oldName === name) {
+      await client.query("ROLLBACK");
+      res.json({ ok: true, item: publicCategory(current.rows[0]), updatedRaw: 0, updatedApproved: 0, categories: await loadCategoriesFromDb() });
+      return;
+    }
     const matchValues = [...new Set([oldName, ...aliases])];
+    const nextAliases = [...new Set([oldName, ...aliases].filter((item) => item && item !== name))];
     const updated = await client.query(
       `UPDATE prompt_categories
        SET name = $2,
+           aliases = $3,
+           target_category_name = $2,
+           sync_status = 'pending',
+           sync_revision = sync_revision + 1,
+           sync_error = NULL,
            updated_at = now()
        WHERE id = $1
-       RETURNING id, name, aliases, sort_order`,
-      [id, name]
+       RETURNING id, name, aliases, target_category_name, sync_status, sync_revision,
+                 last_synced_at, sync_error, sort_order`,
+      [id, name, nextAliases]
     );
     const raw = await client.query("UPDATE raw_prompt_templates SET category = $2 WHERE category = ANY($1::text[])", [matchValues, name]);
     const approved = await client.query("UPDATE approved_prompt_templates SET category = $2 WHERE category = ANY($1::text[])", [matchValues, name]);
+    const queued = await queueApprovedPromptSyncsByCategoryNames(client, [name]);
+    await queueCategorySyncEvent(client, {
+      categoryId: id,
+      eventType: "rename",
+      oldName,
+      newName: name,
+      oldTargetCategoryName,
+      newTargetCategoryName: name,
+      payload: { updatedRaw: raw.rowCount, updatedApproved: approved.rowCount, queuedPrompts: queued },
+      createdBy: req.user?.username || "unknown"
+    });
     await client.query("COMMIT");
     res.json({
       ok: true,
@@ -2099,6 +2326,7 @@ app.get("/api/approved-prompts", async (req, res, next) => {
 });
 
 app.patch("/api/approved-prompts/category", async (req, res, next) => {
+  const client = await pool.connect();
   try {
     const reviewer = req.user?.username || "unknown";
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Number.isFinite) : [];
@@ -2111,7 +2339,8 @@ app.patch("/api/approved-prompts/category", async (req, res, next) => {
       res.status(400).json({ ok: false, error: "INVALID_CATEGORY" });
       return;
     }
-    const result = await pool.query(
+    await client.query("BEGIN");
+    const result = await client.query(
       `UPDATE approved_prompt_templates
        SET category = $2,
            metadata = jsonb_set(
@@ -2124,9 +2353,15 @@ app.patch("/api/approved-prompts/category", async (req, res, next) => {
        RETURNING id`,
       [ids, category, reviewer]
     );
-    res.json({ ok: true, updated: result.rowCount, ids: result.rows.map((row) => row.id) });
+    const updatedIds = result.rows.map((row) => row.id);
+    const queued = await queueApprovedPromptSyncs(client, updatedIds);
+    await client.query("COMMIT");
+    res.json({ ok: true, updated: result.rowCount, queued, ids: updatedIds });
   } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
     next(error);
+  } finally {
+    client.release();
   }
 });
 

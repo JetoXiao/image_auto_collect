@@ -31,6 +31,7 @@ services:
       - postgres_password
     networks:
       - image-auto-collect
+      - awesome-image2
 
   db:
     image: postgres:18
@@ -62,3 +63,6 @@ volumes:
 networks:
   image-auto-collect:
     name: image-auto-collect
+  awesome-image2:
+    external: true
+    name: awesome-image2_default

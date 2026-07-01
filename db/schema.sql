@@ -364,6 +364,8 @@ LEFT JOIN approved_prompt_syncs sync
  AND sync.target_system = 'awesome-image2-web'
 ON CONFLICT (event_key) DO NOTHING;
 
+DROP VIEW IF EXISTS awesome_image2_prompt_export;
+
 CREATE OR REPLACE VIEW awesome_image2_prompt_export AS
 SELECT
   approved.id AS approved_prompt_id,

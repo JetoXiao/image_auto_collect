@@ -1498,7 +1498,7 @@ async function queueAllApprovedForAwesomeSync(createdBy = "system") {
            'category', approved.category,
            'requestedBy', $2
          ),
-         $2
+         $2::text
        FROM approved_prompt_templates approved
        LEFT JOIN approved_prompt_syncs sync
          ON sync.approved_prompt_id = approved.id

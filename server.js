@@ -710,7 +710,7 @@ async function approveRawPromptWithClient(client, id, reviewer) {
          $3,
          $4,
          'pending',
-         jsonb_build_object('source', 'auto-approval', 'reviewer', $5)
+         jsonb_build_object('source', 'auto-approval', 'reviewer', $5::text)
        )
        ON CONFLICT (approved_prompt_id, target_system) DO UPDATE
        SET sync_status = 'pending',

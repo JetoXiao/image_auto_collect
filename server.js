@@ -20,6 +20,7 @@ const historyPath = path.join(dataDir, "scrape-history.json");
 const sessionCookieName = "prompt_review_sid";
 const sessionMaxAgeMs = 12 * 60 * 60 * 1000;
 const schedulerTimeZone = process.env.SCHEDULER_TIME_ZONE || "Asia/Shanghai";
+const awesomeSyncBatchSize = Math.max(1, Math.floor(Number(process.env.UI_AWESOME_SYNC_BATCH_SIZE || 5000)));
 const maxImageBytes = 12 * 1024 * 1024;
 const allowedImageHosts = new Set([
   "pbs.twimg.com",
@@ -75,11 +76,23 @@ function cleanCategoryName(value) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, 80);
 }
 
+function slugFromCategoryName(value, fallback = "category") {
+  const slug = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || `${fallback}-${Date.now().toString(36)}`;
+}
+
 function publicCategory(row) {
   return {
     id: row.id,
     value: row.name,
+    slug: row.slug || null,
+    description: row.description || "",
     aliases: row.aliases || [],
+    isActive: row.is_active !== false,
     targetCategoryName: row.target_category_name || row.name,
     syncStatus: row.sync_status || "pending",
     syncRevision: Number(row.sync_revision || 0),
@@ -91,9 +104,10 @@ function publicCategory(row) {
 
 async function loadCategoriesFromDb() {
   const result = await pool.query(
-    `SELECT id, name, aliases, target_category_name, sync_status, sync_revision,
+    `SELECT id, name, slug, description, aliases, is_active, target_category_name, sync_status, sync_revision,
             last_synced_at, sync_error, sort_order
      FROM prompt_categories
+     WHERE is_active IS DISTINCT FROM FALSE
      ORDER BY sort_order ASC, id ASC`
   );
   categoryOptions = result.rows.map(publicCategory);
@@ -101,6 +115,14 @@ async function loadCategoriesFromDb() {
 }
 
 const awesomeTargetSystem = "awesome-image2-web";
+
+function targetPromptIdForApproved(id) {
+  return `iac_prompt_${id}`;
+}
+
+function targetSlugForApproved(id) {
+  return `image-auto-${id}`;
+}
 
 async function queueApprovedPromptSyncs(client, ids) {
   const cleanIds = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
@@ -150,6 +172,106 @@ async function queueApprovedPromptSyncsByCategoryNames(client, categoryNames) {
     [names, awesomeTargetSystem]
   );
   return result.rowCount;
+}
+
+async function queuePromptSyncEvent(client, event) {
+  const approvedId = Number(event.approvedPromptId);
+  const targetPromptId =
+    event.targetPromptId || (Number.isFinite(approvedId) ? targetPromptIdForApproved(approvedId) : null);
+  if (!targetPromptId) return null;
+  const targetSlug = event.targetSlug || (Number.isFinite(approvedId) ? targetSlugForApproved(approvedId) : null);
+  const result = await client.query(
+    `INSERT INTO prompt_sync_events
+       (target_system, event_type, approved_prompt_id, raw_prompt_id, target_prompt_id,
+        target_slug, snapshot, event_key, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+     ON CONFLICT (event_key) DO NOTHING
+     RETURNING id`,
+    [
+      awesomeTargetSystem,
+      event.eventType || "upsert",
+      Number.isFinite(approvedId) ? approvedId : null,
+      Number.isFinite(Number(event.rawPromptId)) ? Number(event.rawPromptId) : null,
+      targetPromptId,
+      targetSlug,
+      JSON.stringify(event.snapshot || {}),
+      event.eventKey || null,
+      event.createdBy || null
+    ]
+  );
+  return result.rows[0]?.id || null;
+}
+
+async function queuePromptSyncEventsForApprovedIds(client, ids, eventType, createdBy, snapshot = {}) {
+  const cleanIds = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
+  if (!cleanIds.length) return 0;
+  const rows = await client.query(
+    `SELECT
+       approved.id,
+       approved.raw_prompt_id,
+       approved.category,
+       approved.prompt_hash,
+       approved.source_url,
+       COALESCE(sync.target_prompt_id, 'iac_prompt_' || approved.id::text) AS target_prompt_id,
+       COALESCE(sync.target_slug, 'image-auto-' || approved.id::text) AS target_slug
+     FROM approved_prompt_templates approved
+     LEFT JOIN approved_prompt_syncs sync
+       ON sync.approved_prompt_id = approved.id
+      AND sync.target_system = $2
+     WHERE approved.id = ANY($1::bigint[])`,
+    [cleanIds, awesomeTargetSystem]
+  );
+  let queued = 0;
+  for (const row of rows.rows) {
+    const eventId = await queuePromptSyncEvent(client, {
+      approvedPromptId: row.id,
+      rawPromptId: row.raw_prompt_id,
+      targetPromptId: row.target_prompt_id,
+      targetSlug: row.target_slug,
+      eventType,
+      createdBy,
+      snapshot: {
+        ...snapshot,
+        approvedPromptId: row.id,
+        rawPromptId: row.raw_prompt_id,
+        promptHash: row.prompt_hash,
+        category: row.category,
+        sourceUrl: row.source_url
+      }
+    });
+    if (eventId) queued += 1;
+  }
+  return queued;
+}
+
+async function queueRejectSyncForApprovedRow(client, row, createdBy, reason) {
+  if (!row?.id) return null;
+  const sync = await client.query(
+    `SELECT target_prompt_id, target_slug
+     FROM approved_prompt_syncs
+     WHERE approved_prompt_id = $1
+       AND target_system = $2
+     LIMIT 1`,
+    [row.id, awesomeTargetSystem]
+  );
+  return queuePromptSyncEvent(client, {
+    approvedPromptId: row.id,
+    rawPromptId: row.raw_prompt_id,
+    targetPromptId: sync.rows[0]?.target_prompt_id || targetPromptIdForApproved(row.id),
+    targetSlug: sync.rows[0]?.target_slug || targetSlugForApproved(row.id),
+    eventType: "reject",
+    createdBy,
+    snapshot: {
+      reason,
+      approvedPromptId: row.id,
+      rawPromptId: row.raw_prompt_id,
+      promptHash: row.prompt_hash,
+      category: row.category,
+      title: row.title,
+      sourceUrl: row.source_url,
+      rejectedAt: new Date().toISOString()
+    }
+  });
 }
 
 async function queueCategorySyncEvent(client, event) {
@@ -596,6 +718,18 @@ async function approveRawPromptWithClient(client, id, reviewer) {
            updated_at = now()`,
       [approvedId, awesomeTargetSystem, reviewer]
     );
+    await queuePromptSyncEvent(client, {
+      approvedPromptId: approvedId,
+      rawPromptId: id,
+      eventType: "upsert",
+      createdBy: reviewer,
+      snapshot: {
+        reason: duplicate ? "duplicate_approved_prompt_seen" : "approved",
+        rawPromptId: id,
+        approvedPromptId: approvedId,
+        reviewer
+      }
+    });
   }
   return { approvedId, duplicate };
 }
@@ -726,7 +860,10 @@ async function ensureAuthTables() {
     CREATE TABLE IF NOT EXISTS prompt_categories (
       id BIGSERIAL PRIMARY KEY,
       name TEXT NOT NULL UNIQUE,
+      slug TEXT,
+      description TEXT,
       aliases TEXT[] NOT NULL DEFAULT '{}',
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
       sync_key TEXT,
       target_category_name TEXT,
       sync_status TEXT NOT NULL DEFAULT 'pending',
@@ -772,7 +909,28 @@ async function ensureAuthTables() {
       UNIQUE (target_system, target_prompt_id)
     );
 
+    CREATE TABLE IF NOT EXISTS prompt_sync_events (
+      id BIGSERIAL PRIMARY KEY,
+      target_system TEXT NOT NULL DEFAULT 'awesome-image2-web',
+      event_type TEXT NOT NULL,
+      approved_prompt_id BIGINT,
+      raw_prompt_id BIGINT,
+      target_prompt_id TEXT NOT NULL,
+      target_slug TEXT,
+      snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+      sync_status TEXT NOT NULL DEFAULT 'pending',
+      sync_error TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      event_key TEXT UNIQUE,
+      created_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      processed_at TIMESTAMPTZ
+    );
+
     ALTER TABLE prompt_categories
+      ADD COLUMN IF NOT EXISTS slug TEXT,
+      ADD COLUMN IF NOT EXISTS description TEXT,
+      ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE,
       ADD COLUMN IF NOT EXISTS sync_key TEXT,
       ADD COLUMN IF NOT EXISTS target_category_name TEXT,
       ADD COLUMN IF NOT EXISTS sync_status TEXT NOT NULL DEFAULT 'pending',
@@ -786,33 +944,48 @@ async function ensureAuthTables() {
     WHERE sync_key IS NULL OR sync_key = '';
 
     UPDATE prompt_categories
+    SET slug = 'category-' || id::text
+    WHERE slug IS NULL OR slug = '';
+
+    UPDATE prompt_categories
     SET target_category_name = name
     WHERE target_category_name IS NULL OR target_category_name = '';
 
     ALTER TABLE prompt_categories
+      ALTER COLUMN slug SET NOT NULL,
       ALTER COLUMN sync_key SET NOT NULL,
       ALTER COLUMN target_category_name SET NOT NULL;
 
     CREATE INDEX IF NOT EXISTS idx_app_sessions_expires_at ON app_sessions(expires_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_categories_sync_key ON prompt_categories(sync_key);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_categories_slug ON prompt_categories(slug);
     CREATE INDEX IF NOT EXISTS idx_prompt_categories_sync_status ON prompt_categories(sync_status, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_prompt_category_sync_events_status ON prompt_category_sync_events(target_system, sync_status, created_at);
     CREATE INDEX IF NOT EXISTS idx_approved_prompt_syncs_status ON approved_prompt_syncs(target_system, sync_status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_prompt_sync_events_status ON prompt_sync_events(target_system, sync_status, created_at, id);
+    CREATE INDEX IF NOT EXISTS idx_prompt_sync_events_target_prompt ON prompt_sync_events(target_system, target_prompt_id);
   `);
 
   for (const [index, category] of defaultCategoryOptions.entries()) {
     await pool.query(
-      `INSERT INTO prompt_categories (name, aliases, sync_key, target_category_name, sort_order)
-       VALUES ($1, $2, $3, $1, $4)
+      `INSERT INTO prompt_categories (name, slug, aliases, sync_key, target_category_name, sort_order)
+       VALUES ($1, $2, $3, $4, $1, $5)
        ON CONFLICT (name) DO UPDATE
-       SET aliases = EXCLUDED.aliases,
+       SET slug = COALESCE(prompt_categories.slug, EXCLUDED.slug),
+           aliases = EXCLUDED.aliases,
            target_category_name = COALESCE(prompt_categories.target_category_name, EXCLUDED.target_category_name),
            sort_order = CASE
              WHEN prompt_categories.sort_order = 0 THEN EXCLUDED.sort_order
              ELSE prompt_categories.sort_order
            END,
            updated_at = now()`,
-      [category.value, category.aliases, `category:seed:${index + 1}`, (index + 1) * 10]
+      [
+        category.value,
+        category.slug || slugFromCategoryName(category.value, `category-seed-${index + 1}`),
+        category.aliases,
+        `category:seed:${index + 1}`,
+        (index + 1) * 10
+      ]
     );
   }
 
@@ -821,6 +994,32 @@ async function ensureAuthTables() {
      SELECT id, $1, 'iac_prompt_' || id::text, 'image-auto-' || id::text
      FROM approved_prompt_templates
      ON CONFLICT (approved_prompt_id, target_system) DO NOTHING`,
+    [awesomeTargetSystem]
+  );
+
+  await pool.query(
+    `INSERT INTO prompt_sync_events
+       (target_system, event_type, approved_prompt_id, raw_prompt_id, target_prompt_id, target_slug, snapshot, event_key, created_by)
+     SELECT
+       $1,
+       'upsert',
+       approved.id,
+       approved.raw_prompt_id,
+       COALESCE(sync.target_prompt_id, 'iac_prompt_' || approved.id::text),
+       COALESCE(sync.target_slug, 'image-auto-' || approved.id::text),
+       jsonb_build_object(
+         'reason', 'bootstrap',
+         'approvedPromptId', approved.id,
+         'promptHash', approved.prompt_hash,
+         'category', approved.category
+       ),
+       $1 || ':bootstrap:approved:' || approved.id::text,
+       'system'
+     FROM approved_prompt_templates approved
+     LEFT JOIN approved_prompt_syncs sync
+       ON sync.approved_prompt_id = approved.id
+      AND sync.target_system = $1
+     ON CONFLICT (event_key) DO NOTHING`,
     [awesomeTargetSystem]
   );
 
@@ -980,6 +1179,29 @@ const doingfbRun = {
   logPath: null,
   task: null,
   logs: []
+};
+
+const awesomeSyncRun = {
+  status: "idle",
+  runId: null,
+  trigger: "manual",
+  mode: "pending",
+  requestedBy: null,
+  startedAt: null,
+  endedAt: null,
+  pid: null,
+  before: null,
+  counts: null,
+  summary: null,
+  queuedAll: 0,
+  error: null,
+  logPath: null,
+  logs: [],
+  _child: null,
+  _stdoutBuffer: "",
+  _stderrBuffer: "",
+  _stdoutText: "",
+  _stderrText: ""
 };
 
 const doingfbBatchReviewState = {
@@ -1160,6 +1382,290 @@ async function saveSchedules() {
 async function saveHistory() {
   scrapeHistory = scrapeHistory.slice(0, 80);
   await writeJsonFile(historyPath, scrapeHistory);
+}
+
+function isAwesomeSyncActive() {
+  return awesomeSyncRun.status === "running";
+}
+
+function addAwesomeSyncLog(line) {
+  const text = String(line || "").trimEnd();
+  if (!text) return;
+  const entry = `${new Date().toLocaleTimeString("zh-CN", { hour12: false })} ${text}`;
+  awesomeSyncRun.logs.push(entry);
+  if (awesomeSyncRun.logs.length > 120) awesomeSyncRun.logs.splice(0, awesomeSyncRun.logs.length - 120);
+  if (awesomeSyncRun.logPath) {
+    fs.mkdir(path.dirname(awesomeSyncRun.logPath), { recursive: true })
+      .then(() => fs.appendFile(awesomeSyncRun.logPath, `${entry}\n`, "utf8"))
+      .catch((error) => console.warn("Failed to write awesome sync log:", error.message));
+  }
+}
+
+async function readAwesomeSyncCounts() {
+  const [promptEvents, categoryEvents, promptSyncs] = await Promise.all([
+    pool.query(
+      `SELECT sync_status, count(*)::int AS count
+       FROM prompt_sync_events
+       WHERE target_system = $1
+       GROUP BY sync_status`,
+      [awesomeTargetSystem]
+    ),
+    pool.query(
+      `SELECT sync_status, count(*)::int AS count
+       FROM prompt_category_sync_events
+       WHERE target_system = $1
+       GROUP BY sync_status`,
+      [awesomeTargetSystem]
+    ),
+    pool.query(
+      `SELECT sync_status, count(*)::int AS count
+       FROM approved_prompt_syncs
+       WHERE target_system = $1
+       GROUP BY sync_status`,
+      [awesomeTargetSystem]
+    )
+  ]);
+  const eventCounts = Object.fromEntries(promptEvents.rows.map((row) => [row.sync_status, row.count]));
+  const categoryCounts = Object.fromEntries(categoryEvents.rows.map((row) => [row.sync_status, row.count]));
+  const approvedCounts = Object.fromEntries(promptSyncs.rows.map((row) => [row.sync_status, row.count]));
+  return {
+    promptEvents: eventCounts,
+    categoryEvents: categoryCounts,
+    approvedSyncs: approvedCounts,
+    pendingTotal:
+      (eventCounts.pending || 0) +
+      (eventCounts.failed || 0) +
+      (categoryCounts.pending || 0) +
+      (categoryCounts.failed || 0)
+  };
+}
+
+function resetAwesomeSyncRun(options = {}, before = null) {
+  awesomeSyncRun.status = "running";
+  awesomeSyncRun.runId = timestampForFile();
+  awesomeSyncRun.trigger = options.trigger || "manual";
+  awesomeSyncRun.mode = options.mode || "pending";
+  awesomeSyncRun.requestedBy = options.requestedBy || null;
+  awesomeSyncRun.startedAt = new Date().toISOString();
+  awesomeSyncRun.endedAt = null;
+  awesomeSyncRun.pid = null;
+  awesomeSyncRun.before = before;
+  awesomeSyncRun.counts = null;
+  awesomeSyncRun.summary = null;
+  awesomeSyncRun.queuedAll = 0;
+  awesomeSyncRun.error = null;
+  awesomeSyncRun.logPath = path.join(logsDir, `awesome-sync-${awesomeSyncRun.runId}.log`);
+  awesomeSyncRun.logs = [];
+  awesomeSyncRun._child = null;
+  awesomeSyncRun._stdoutBuffer = "";
+  awesomeSyncRun._stderrBuffer = "";
+  awesomeSyncRun._stdoutText = "";
+  awesomeSyncRun._stderrText = "";
+}
+
+async function queueAllApprovedForAwesomeSync(createdBy = "system") {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO approved_prompt_syncs
+         (approved_prompt_id, target_system, target_prompt_id, target_slug, sync_status)
+       SELECT id, $1, 'iac_prompt_' || id::text, 'image-auto-' || id::text, 'pending'
+       FROM approved_prompt_templates
+       ON CONFLICT (approved_prompt_id, target_system) DO UPDATE
+       SET sync_status = 'pending',
+           sync_error = NULL,
+           target_prompt_id = COALESCE(approved_prompt_syncs.target_prompt_id, EXCLUDED.target_prompt_id),
+           target_slug = COALESCE(approved_prompt_syncs.target_slug, EXCLUDED.target_slug),
+           updated_at = now()`,
+      [awesomeTargetSystem]
+    );
+    const result = await client.query(
+      `INSERT INTO prompt_sync_events
+         (target_system, event_type, approved_prompt_id, raw_prompt_id, target_prompt_id,
+          target_slug, snapshot, created_by)
+       SELECT
+         $1,
+         'upsert',
+         approved.id,
+         approved.raw_prompt_id,
+         COALESCE(sync.target_prompt_id, 'iac_prompt_' || approved.id::text),
+         COALESCE(sync.target_slug, 'image-auto-' || approved.id::text),
+         jsonb_build_object(
+           'reason', 'manual_requeue_all',
+           'approvedPromptId', approved.id,
+           'promptHash', approved.prompt_hash,
+           'category', approved.category,
+           'requestedBy', $2
+         ),
+         $2
+       FROM approved_prompt_templates approved
+       LEFT JOIN approved_prompt_syncs sync
+         ON sync.approved_prompt_id = approved.id
+        AND sync.target_system = $1
+       RETURNING id`,
+      [awesomeTargetSystem, createdBy]
+    );
+    await client.query("COMMIT");
+    return result.rowCount;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function handleAwesomeSyncOutput(chunk, streamName) {
+  const text = chunk.toString("utf8");
+  if (streamName === "stdout") awesomeSyncRun._stdoutText += text;
+  else awesomeSyncRun._stderrText += text;
+  const field = streamName === "stderr" ? "_stderrBuffer" : "_stdoutBuffer";
+  awesomeSyncRun[field] += text;
+  const lines = awesomeSyncRun[field].split(/\r?\n/);
+  awesomeSyncRun[field] = lines.pop() || "";
+  for (const line of lines) {
+    if (line.trim()) addAwesomeSyncLog(`[${streamName}] ${line}`);
+  }
+}
+
+function parseAwesomeSyncSummary() {
+  const text = awesomeSyncRun._stdoutText.trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.lastIndexOf("{");
+    if (start >= 0) {
+      try {
+        return JSON.parse(text.slice(start));
+      } catch {}
+    }
+    return { raw: text.slice(-2000) };
+  }
+}
+
+async function finishAwesomeSyncRun(code) {
+  for (const streamName of ["stdout", "stderr"]) {
+    const field = streamName === "stderr" ? "_stderrBuffer" : "_stdoutBuffer";
+    if (awesomeSyncRun[field]) handleAwesomeSyncOutput("\n", streamName);
+  }
+  awesomeSyncRun.endedAt = new Date().toISOString();
+  awesomeSyncRun.pid = null;
+  awesomeSyncRun._child = null;
+  awesomeSyncRun.summary = parseAwesomeSyncSummary();
+  awesomeSyncRun.counts = await readAwesomeSyncCounts().catch(() => null);
+  if (code === 0) {
+    awesomeSyncRun.status = "completed";
+    addAwesomeSyncLog("awesome-image2 同步完成");
+    const pendingEvents =
+      (awesomeSyncRun.counts?.promptEvents?.pending || 0) +
+      (awesomeSyncRun.counts?.categoryEvents?.pending || 0);
+    if (pendingEvents > 0) {
+      addAwesomeSyncLog(`检测到仍有 ${pendingEvents} 条待同步事件，准备自动续跑`);
+      setTimeout(() => {
+        startAwesomeSyncRun({ trigger: "auto-continue", requestedBy: "system" }).catch((error) => {
+          addAwesomeSyncLog(`自动续跑失败：${error.message}`);
+          console.error("Awesome sync auto-continue failed:", error);
+        });
+      }, 1000);
+    }
+  } else {
+    awesomeSyncRun.status = "error";
+    awesomeSyncRun.error = awesomeSyncRun._stderrText.trim().slice(-1000) || `SYNC_EXIT_${code}`;
+    addAwesomeSyncLog(`awesome-image2 同步失败：${awesomeSyncRun.error}`);
+  }
+}
+
+async function startAwesomeSyncRun(options = {}) {
+  if (isAwesomeSyncActive()) {
+    addAwesomeSyncLog(`已有同步任务运行中，跳过 ${options.trigger || "manual"} 触发`);
+    return { started: false, reason: "SYNC_ALREADY_RUNNING", status: await publicAwesomeSyncStatus() };
+  }
+
+  const before = await readAwesomeSyncCounts().catch(() => null);
+  resetAwesomeSyncRun(options, before);
+  try {
+    if (options.mode === "requeue-all") {
+      awesomeSyncRun.queuedAll = await queueAllApprovedForAwesomeSync(options.requestedBy || "manual");
+      addAwesomeSyncLog(`已将 ${awesomeSyncRun.queuedAll} 条已通过提示词重新加入同步队列`);
+    }
+  } catch (error) {
+    awesomeSyncRun.status = "error";
+    awesomeSyncRun.error = error.message;
+    awesomeSyncRun.endedAt = new Date().toISOString();
+    addAwesomeSyncLog(`同步排队失败：${error.message}`);
+    throw error;
+  }
+
+  const args = [path.join(__dirname, "scripts", "sync-awesome-image2.js"), "--limit", String(awesomeSyncBatchSize)];
+  if (options.all) args.push("--all");
+  const child = spawn(process.execPath, args, {
+    cwd: __dirname,
+    env: { ...process.env },
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  awesomeSyncRun._child = child;
+  awesomeSyncRun.pid = child.pid;
+  addAwesomeSyncLog(`awesome-image2 同步已启动，PID ${child.pid}，模式 ${awesomeSyncRun.mode}`);
+  child.stdout.on("data", (chunk) => handleAwesomeSyncOutput(chunk, "stdout"));
+  child.stderr.on("data", (chunk) => handleAwesomeSyncOutput(chunk, "stderr"));
+  child.on("error", (error) => {
+    awesomeSyncRun.status = "error";
+    awesomeSyncRun.error = error.message;
+    awesomeSyncRun.endedAt = new Date().toISOString();
+    awesomeSyncRun._child = null;
+    addAwesomeSyncLog(`awesome-image2 同步启动失败：${error.message}`);
+  });
+  child.on("close", (code) => {
+    finishAwesomeSyncRun(code).catch((error) => {
+      awesomeSyncRun.status = "error";
+      awesomeSyncRun.error = error.message;
+      console.error("Failed to finalize awesome sync:", error);
+    });
+  });
+  return { started: true, status: await publicAwesomeSyncStatus() };
+}
+
+function autoStartAwesomeSync(options = {}) {
+  startAwesomeSyncRun({ ...options, mode: options.mode || "pending" }).catch((error) => {
+    addAwesomeSyncLog(`自动同步触发失败：${error.message}`);
+    console.error("Auto awesome sync failed:", error);
+  });
+}
+
+async function publicAwesomeSyncStatus() {
+  const counts = await readAwesomeSyncCounts();
+  const beforePending = awesomeSyncRun.before?.pendingTotal || counts.pendingTotal;
+  const pendingNow = counts.pendingTotal;
+  const progress =
+    awesomeSyncRun.status === "running"
+      ? beforePending > 0
+        ? Math.max(0, Math.min(99, Math.round(((beforePending - pendingNow) / beforePending) * 100)))
+        : 10
+      : awesomeSyncRun.status === "idle"
+        ? 0
+        : 100;
+  return {
+    ok: true,
+    status: awesomeSyncRun.status,
+    runId: awesomeSyncRun.runId,
+    trigger: awesomeSyncRun.trigger,
+    mode: awesomeSyncRun.mode,
+    requestedBy: awesomeSyncRun.requestedBy,
+    startedAt: awesomeSyncRun.startedAt,
+    endedAt: awesomeSyncRun.endedAt,
+    pid: awesomeSyncRun.pid,
+    queuedAll: awesomeSyncRun.queuedAll,
+    progress,
+    before: awesomeSyncRun.before,
+    counts,
+    summary: awesomeSyncRun.summary,
+    error: awesomeSyncRun.error,
+    logs: awesomeSyncRun.logs.slice(-50),
+    logPath: awesomeSyncRun.logPath
+  };
 }
 
 function taskTemplate(name, label) {
@@ -1343,6 +1849,10 @@ async function reviewDoingfbBatch(force = false) {
     addDoingfbLog(
       `DoingFB 批次初审完成：扫描 ${summary.scanned}，通过 ${summary.approved}，重复 ${summary.duplicate}，驳回 ${summary.rejected}，清理 ${summary.cleaned}，失败 ${summary.failed}`
     );
+    if ((summary.approved || 0) + (summary.duplicate || 0) > 0) {
+      addDoingfbLog("DoingFB 批次通过数据已入队，触发 awesome-image2 同步");
+      autoStartAwesomeSync({ trigger: "doingfb-auto-review", requestedBy: "auto:doingfb" });
+    }
     return summary;
   } finally {
     doingfbBatchReviewState.running = false;
@@ -1593,6 +2103,10 @@ async function completeScrapeRun(tasks = Object.values(scrapeRun.tasks || {})) {
         endedAt: taskEndedAt,
         order: "oldest"
       });
+      if ((autoReviewSummary.approved || 0) + (autoReviewSummary.duplicate || 0) > 0) {
+        addScrapeLog("采集后自动审核已入队，触发 awesome-image2 同步");
+        autoStartAwesomeSync({ trigger: "scrape-auto-review", requestedBy: "auto:scrape" });
+      }
       addScrapeLog(
         `自动初审完成：扫描 ${autoReviewSummary.scanned}，通过 ${autoReviewSummary.approved}，重复 ${autoReviewSummary.duplicate}，驳回 ${autoReviewSummary.rejected}，清洗 ${autoReviewSummary.cleaned}，失败 ${autoReviewSummary.failed}`
       );
@@ -2132,19 +2646,20 @@ app.post("/api/categories", async (req, res, next) => {
     await client.query("BEGIN");
     const maxOrder = await client.query("SELECT COALESCE(max(sort_order), 0)::int AS sort_order FROM prompt_categories");
     const provisionalSyncKey = `category:new:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const provisionalSlug = `category-new-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const result = await client.query(
-      `INSERT INTO prompt_categories (name, aliases, sync_key, target_category_name, sync_status, sync_revision, sort_order)
-       VALUES ($1, '{}', $2, $1, 'pending', 1, $3)
-       RETURNING id, name, aliases, target_category_name, sync_status, sync_revision,
-                 last_synced_at, sync_error, sort_order`,
-      [name, provisionalSyncKey, (maxOrder.rows[0]?.sort_order || 0) + 10]
+      `INSERT INTO prompt_categories (name, slug, aliases, sync_key, target_category_name, sync_status, sync_revision, sort_order)
+       VALUES ($1, $2, '{}', $3, $1, 'pending', 1, $4)
+       RETURNING id`,
+      [name, provisionalSlug, provisionalSyncKey, (maxOrder.rows[0]?.sort_order || 0) + 10]
     );
     const categoryId = result.rows[0].id;
     await client.query(
       `UPDATE prompt_categories
-       SET sync_key = $2
+       SET sync_key = $2,
+           slug = $4
        WHERE id = $1 AND sync_key = $3`,
-      [categoryId, `category:${categoryId}`, provisionalSyncKey]
+      [categoryId, `category:${categoryId}`, provisionalSyncKey, slugFromCategoryName(name, `category-${categoryId}`)]
     );
     await queueCategorySyncEvent(client, {
       categoryId,
@@ -2153,8 +2668,16 @@ app.post("/api/categories", async (req, res, next) => {
       newTargetCategoryName: name,
       createdBy: reviewer
     });
+    const category = await client.query(
+      `SELECT id, name, slug, description, aliases, is_active, target_category_name, sync_status, sync_revision,
+              last_synced_at, sync_error, sort_order
+       FROM prompt_categories
+       WHERE id = $1`,
+      [categoryId]
+    );
     await client.query("COMMIT");
-    res.json({ ok: true, item: publicCategory(result.rows[0]), categories: await loadCategoriesFromDb() });
+    autoStartAwesomeSync({ trigger: "category-create", requestedBy: reviewer });
+    res.json({ ok: true, item: publicCategory(category.rows[0]), categories: await loadCategoriesFromDb() });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     if (error.code === "23505") {
@@ -2178,7 +2701,7 @@ app.patch("/api/categories/:id", async (req, res, next) => {
     }
     await client.query("BEGIN");
     const current = await client.query(
-      "SELECT id, name, aliases, target_category_name FROM prompt_categories WHERE id = $1 FOR UPDATE",
+      "SELECT id, name, slug, description, aliases, is_active, target_category_name, sync_status, sync_revision, last_synced_at, sync_error, sort_order FROM prompt_categories WHERE id = $1 FOR UPDATE",
       [id]
     );
     if (!current.rowCount) {
@@ -2206,13 +2729,23 @@ app.patch("/api/categories/:id", async (req, res, next) => {
            sync_error = NULL,
            updated_at = now()
        WHERE id = $1
-       RETURNING id, name, aliases, target_category_name, sync_status, sync_revision,
+       RETURNING id, name, slug, description, aliases, is_active, target_category_name, sync_status, sync_revision,
                  last_synced_at, sync_error, sort_order`,
       [id, name, nextAliases]
     );
     const raw = await client.query("UPDATE raw_prompt_templates SET category = $2 WHERE category = ANY($1::text[])", [matchValues, name]);
-    const approved = await client.query("UPDATE approved_prompt_templates SET category = $2 WHERE category = ANY($1::text[])", [matchValues, name]);
+    const approved = await client.query(
+      "UPDATE approved_prompt_templates SET category = $2 WHERE category = ANY($1::text[]) RETURNING id",
+      [matchValues, name]
+    );
     const queued = await queueApprovedPromptSyncsByCategoryNames(client, [name]);
+    const queuedEvents = await queuePromptSyncEventsForApprovedIds(
+      client,
+      approved.rows.map((row) => row.id),
+      "category_update",
+      req.user?.username || "unknown",
+      { reason: "category_renamed", oldName, newName: name }
+    );
     await queueCategorySyncEvent(client, {
       categoryId: id,
       eventType: "rename",
@@ -2220,10 +2753,11 @@ app.patch("/api/categories/:id", async (req, res, next) => {
       newName: name,
       oldTargetCategoryName,
       newTargetCategoryName: name,
-      payload: { updatedRaw: raw.rowCount, updatedApproved: approved.rowCount, queuedPrompts: queued },
+      payload: { updatedRaw: raw.rowCount, updatedApproved: approved.rowCount, queuedPrompts: queued, queuedEvents },
       createdBy: req.user?.username || "unknown"
     });
     await client.query("COMMIT");
+    autoStartAwesomeSync({ trigger: "category-rename", requestedBy: req.user?.username || "unknown" });
     res.json({
       ok: true,
       item: publicCategory(updated.rows[0]),
@@ -2355,8 +2889,15 @@ app.patch("/api/approved-prompts/category", async (req, res, next) => {
     );
     const updatedIds = result.rows.map((row) => row.id);
     const queued = await queueApprovedPromptSyncs(client, updatedIds);
+    const queuedEvents = await queuePromptSyncEventsForApprovedIds(client, updatedIds, "category_update", reviewer, {
+      reason: "approved_prompt_category_bulk_edit",
+      category
+    });
     await client.query("COMMIT");
-    res.json({ ok: true, updated: result.rowCount, queued, ids: updatedIds });
+    if (updatedIds.length) {
+      autoStartAwesomeSync({ trigger: "approved-category-edit", requestedBy: reviewer });
+    }
+    res.json({ ok: true, updated: result.rowCount, queued, queuedEvents, ids: updatedIds });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     next(error);
@@ -2400,14 +2941,35 @@ app.post("/api/approved-prompts/:id/reject", async (req, res, next) => {
           OR id = $4`,
       [id, reviewer, reason, row.raw_prompt_id || 0]
     );
+    await queueRejectSyncForApprovedRow(client, row, reviewer, reason);
     await client.query("DELETE FROM approved_prompt_templates WHERE id = $1", [id]);
     await client.query("COMMIT");
+    autoStartAwesomeSync({ trigger: "approved-reject", requestedBy: reviewer });
     res.json({ ok: true, id, rawPromptId: row.raw_prompt_id || null });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     next(error);
   } finally {
     client.release();
+  }
+});
+
+app.get("/api/awesome-sync/status", async (_req, res, next) => {
+  try {
+    res.json(await publicAwesomeSyncStatus());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/awesome-sync/start", async (req, res, next) => {
+  try {
+    const reviewer = req.user?.username || "unknown";
+    const mode = req.body?.mode === "requeue-all" ? "requeue-all" : "pending";
+    await startAwesomeSyncRun({ trigger: "manual", mode, requestedBy: reviewer });
+    res.json(await publicAwesomeSyncStatus());
+  } catch (error) {
+    next(error);
   }
 });
 
@@ -2735,6 +3297,9 @@ app.post("/api/raw-prompts/auto-review", async (req, res, next) => {
       sourcePlatform: req.body?.sourcePlatform || "",
       order: "latest"
     });
+    if ((summary.approved || 0) + (summary.duplicate || 0) > 0) {
+      autoStartAwesomeSync({ trigger: "manual-auto-review", requestedBy: reviewer });
+    }
     res.json({ ok: true, ...summary });
   } catch (error) {
     next(error);
@@ -2821,6 +3386,9 @@ app.post("/api/raw-prompts/:id/approve", async (req, res, next) => {
 
     const { approvedId, duplicate } = await approveRawPromptWithClient(client, id, reviewer);
     await client.query("COMMIT");
+    if (approvedId) {
+      autoStartAwesomeSync({ trigger: "manual-approve", requestedBy: reviewer });
+    }
     res.json({ ok: true, approvedTemplateId: approvedId, duplicate });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
@@ -2831,6 +3399,7 @@ app.post("/api/raw-prompts/:id/approve", async (req, res, next) => {
 });
 
 app.post("/api/raw-prompts/:id/reject", async (req, res, next) => {
+  const client = await pool.connect();
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) {
@@ -2839,7 +3408,27 @@ app.post("/api/raw-prompts/:id/reject", async (req, res, next) => {
     }
     const reviewer = req.user?.username || "unknown";
     const reason = String(req.body?.reason || "").slice(0, 500);
-    const result = await pool.query(
+    await client.query("BEGIN");
+    const raw = await client.query("SELECT * FROM raw_prompt_templates WHERE id = $1 FOR UPDATE", [id]);
+    if (!raw.rowCount) {
+      await client.query("ROLLBACK");
+      res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      return;
+    }
+    const approvedTemplateId = raw.rows[0].approved_template_id;
+    if (approvedTemplateId) {
+      const approved = await client.query("SELECT * FROM approved_prompt_templates WHERE id = $1 FOR UPDATE", [approvedTemplateId]);
+      if (approved.rowCount && String(approved.rows[0].raw_prompt_id || "") === String(id)) {
+        await queueRejectSyncForApprovedRow(
+          client,
+          approved.rows[0],
+          reviewer,
+          reason || "raw_prompt_rejected"
+        );
+        await client.query("DELETE FROM approved_prompt_templates WHERE id = $1", [approvedTemplateId]);
+      }
+    }
+    const result = await client.query(
       `UPDATE raw_prompt_templates
        SET review_status = 'rejected',
            reviewed_by = $2,
@@ -2850,16 +3439,44 @@ app.post("/api/raw-prompts/:id/reject", async (req, res, next) => {
        RETURNING id`,
       [id, reviewer, reason || null]
     );
+    await client.query("COMMIT");
+    if (approvedTemplateId) {
+      autoStartAwesomeSync({ trigger: "raw-reject", requestedBy: reviewer });
+    }
     res.json({ ok: result.rowCount === 1 });
   } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
     next(error);
+  } finally {
+    client.release();
   }
 });
 
 app.post("/api/raw-prompts/:id/pending", async (req, res, next) => {
+  const client = await pool.connect();
   try {
     const id = Number(req.params.id);
-    const result = await pool.query(
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ ok: false, error: "INVALID_ID" });
+      return;
+    }
+    const reviewer = req.user?.username || "unknown";
+    await client.query("BEGIN");
+    const raw = await client.query("SELECT * FROM raw_prompt_templates WHERE id = $1 FOR UPDATE", [id]);
+    if (!raw.rowCount) {
+      await client.query("ROLLBACK");
+      res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      return;
+    }
+    const approvedTemplateId = raw.rows[0].approved_template_id;
+    if (approvedTemplateId) {
+      const approved = await client.query("SELECT * FROM approved_prompt_templates WHERE id = $1 FOR UPDATE", [approvedTemplateId]);
+      if (approved.rowCount && String(approved.rows[0].raw_prompt_id || "") === String(id)) {
+        await queueRejectSyncForApprovedRow(client, approved.rows[0], reviewer, "raw_prompt_returned_to_pending");
+        await client.query("DELETE FROM approved_prompt_templates WHERE id = $1", [approvedTemplateId]);
+      }
+    }
+    const result = await client.query(
       `UPDATE raw_prompt_templates
        SET review_status = 'pending',
            reviewed_by = NULL,
@@ -2870,9 +3487,16 @@ app.post("/api/raw-prompts/:id/pending", async (req, res, next) => {
        RETURNING id`,
       [id]
     );
+    await client.query("COMMIT");
+    if (approvedTemplateId) {
+      autoStartAwesomeSync({ trigger: "raw-return-pending", requestedBy: reviewer });
+    }
     res.json({ ok: result.rowCount === 1 });
   } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
     next(error);
+  } finally {
+    client.release();
   }
 });
 

@@ -100,6 +100,32 @@ async function ensureLocalSyncRows(source) {
      ON CONFLICT (approved_prompt_id, target_system) DO NOTHING`,
     [targetSystem]
   );
+
+  await source.query(
+    `INSERT INTO prompt_sync_events
+       (target_system, event_type, approved_prompt_id, raw_prompt_id, target_prompt_id, target_slug, snapshot, event_key, created_by)
+     SELECT
+       $1,
+       'upsert',
+       approved.id,
+       approved.raw_prompt_id,
+       COALESCE(sync.target_prompt_id, 'iac_prompt_' || approved.id::text),
+       COALESCE(sync.target_slug, 'image-auto-' || approved.id::text),
+       jsonb_build_object(
+         'reason', 'bootstrap',
+         'approvedPromptId', approved.id,
+         'promptHash', approved.prompt_hash,
+         'category', approved.category
+       ),
+       $1 || ':bootstrap:approved:' || approved.id::text,
+       'system'
+     FROM approved_prompt_templates approved
+     LEFT JOIN approved_prompt_syncs sync
+       ON sync.approved_prompt_id = approved.id
+      AND sync.target_system = $1
+     ON CONFLICT (event_key) DO NOTHING`,
+    [targetSystem]
+  );
 }
 
 async function loadCategoryEvents(source) {
@@ -172,21 +198,34 @@ async function syncCategoryEvent(source, target, event) {
   return { id: event.id, action: event.event_type, updated: 0 };
 }
 
-async function loadPromptRows(source) {
+async function loadPromptEvents(source) {
   const statuses = syncStatuses();
-  const params = [batchSize];
-  const statusClause = statuses ? "AND sync_status = ANY($2::text[])" : "";
+  const params = [targetSystem, batchSize];
+  const statusClause = statuses ? "AND sync_status = ANY($3::text[])" : "";
   if (statuses) params.push(statuses);
   const result = await source.query(
     `SELECT *
-     FROM awesome_image2_prompt_export
-     WHERE cardinality(image_urls) > 0
+     FROM prompt_sync_events
+     WHERE target_system = $1
        ${statusClause}
-     ORDER BY approved_at ASC, approved_prompt_id ASC
-     LIMIT $1`,
+     ORDER BY id ASC
+     LIMIT $2`,
     params
   );
   return result.rows;
+}
+
+async function loadPromptExportRow(source, event) {
+  const result = await source.query(
+    `SELECT *
+     FROM awesome_image2_prompt_export
+     WHERE ($1::bigint IS NOT NULL AND approved_prompt_id = $1::bigint)
+        OR target_prompt_id = $2
+     ORDER BY approved_prompt_id DESC
+     LIMIT 1`,
+    [event.approved_prompt_id || null, event.target_prompt_id]
+  );
+  return result.rows[0] || null;
 }
 
 async function upsertPrompt(target, row) {
@@ -284,38 +323,112 @@ async function upsertPrompt(target, row) {
   }
 }
 
-async function markPromptSynced(source, row, result) {
+async function archivePrompt(target, event) {
+  const result = await target.query(
+    `UPDATE "Prompt"
+     SET "reviewStatus" = 'REJECTED',
+         "publishStatus" = 'ARCHIVED',
+         "updatedAt" = now()
+     WHERE "id" = $1
+       AND left("id", length($2)) = $2`,
+    [event.target_prompt_id, "iac_prompt_"]
+  );
+  return { promptId: event.target_prompt_id, archived: result.rowCount };
+}
+
+async function deletePrompt(target, event) {
+  if (!String(event.target_prompt_id || "").startsWith("iac_prompt_")) {
+    return { promptId: event.target_prompt_id, deleted: 0, skipped: "unsafe_target_id" };
+  }
+  await target.query("BEGIN");
+  try {
+    await target.query(`DELETE FROM "PromptImage" WHERE "promptId" = $1`, [event.target_prompt_id]);
+    const result = await target.query(`DELETE FROM "Prompt" WHERE "id" = $1`, [event.target_prompt_id]);
+    await target.query("COMMIT");
+    return { promptId: event.target_prompt_id, deleted: result.rowCount };
+  } catch (error) {
+    await target.query("ROLLBACK").catch(() => {});
+    throw error;
+  }
+}
+
+async function markPromptEvent(source, event, status, error = null, payload = {}) {
+  await source.query(
+    `UPDATE prompt_sync_events
+     SET sync_status = $2,
+         sync_error = $3,
+         snapshot = snapshot || $4::jsonb,
+         attempt_count = attempt_count + 1,
+         processed_at = CASE WHEN $2 IN ('synced', 'skipped') THEN now() ELSE processed_at END
+     WHERE id = $1`,
+    [event.id, status, error ? String(error).slice(0, 1000) : null, JSON.stringify(payload)]
+  );
+}
+
+async function markApprovedPromptSync(source, row, status, error = null, payload = {}) {
+  if (!row?.approved_prompt_id) return;
   await source.query(
     `UPDATE approved_prompt_syncs
-     SET target_prompt_id = $3,
-         target_slug = $4,
-         sync_status = 'synced',
-         sync_error = NULL,
-         sync_payload = sync_payload || $5::jsonb,
-         last_synced_at = now(),
+     SET target_prompt_id = COALESCE($3, target_prompt_id),
+         target_slug = COALESCE($4, target_slug),
+         sync_status = $5,
+         sync_error = $6,
+         sync_payload = sync_payload || $7::jsonb,
+         last_synced_at = CASE WHEN $5 = 'synced' THEN now() ELSE last_synced_at END,
          updated_at = now()
      WHERE approved_prompt_id = $1
        AND target_system = $2`,
     [
       row.approved_prompt_id,
       targetSystem,
-      result.promptId,
-      result.slug,
-      JSON.stringify({ imageCount: result.imageCount, category: result.category })
+      row.target_prompt_id || null,
+      row.target_slug || null,
+      status,
+      error ? String(error).slice(0, 1000) : null,
+      JSON.stringify(payload)
     ]
   );
 }
 
-async function markPromptFailed(source, row, error) {
-  await source.query(
-    `UPDATE approved_prompt_syncs
-     SET sync_status = 'failed',
-         sync_error = $3,
-         updated_at = now()
-     WHERE approved_prompt_id = $1
-       AND target_system = $2`,
-    [row.approved_prompt_id, targetSystem, String(error.message || error).slice(0, 1000)]
-  );
+async function syncPromptEvent(source, target, event) {
+  if (dryRun) {
+    return { id: event.id, action: event.event_type, targetPromptId: event.target_prompt_id, dryRun: true };
+  }
+
+  if (event.event_type === "reject") {
+    const result = await archivePrompt(target, event);
+    await markPromptEvent(source, event, "synced", null, result);
+    return { ...result, action: "reject" };
+  }
+
+  if (event.event_type === "delete") {
+    const result = await deletePrompt(target, event);
+    await markPromptEvent(source, event, result.skipped ? "skipped" : "synced", null, result);
+    return { ...result, action: "delete" };
+  }
+
+  const row = await loadPromptExportRow(source, event);
+  if (!row) {
+    const payload = { reason: "source_prompt_missing", targetPromptId: event.target_prompt_id };
+    await markPromptEvent(source, event, "skipped", null, payload);
+    return { ...payload, action: event.event_type, skipped: true };
+  }
+
+  if (!imageUrls(row.image_urls).length) {
+    const payload = { reason: "no_images", approvedPromptId: row.approved_prompt_id };
+    await markPromptEvent(source, event, "skipped", null, payload);
+    await markApprovedPromptSync(source, row, "skipped", "NO_IMAGES", payload);
+    return { ...payload, action: event.event_type, skipped: true };
+  }
+
+  const result = await upsertPrompt(target, row);
+  await markPromptEvent(source, event, "synced", null, result);
+  await markApprovedPromptSync(source, row, "synced", null, {
+    imageCount: result.imageCount,
+    category: result.category,
+    eventId: event.id
+  });
+  return { ...result, action: event.event_type };
 }
 
 async function main() {
@@ -326,21 +439,30 @@ async function main() {
     dryRun,
     syncAll,
     categoryEvents: { scanned: 0, synced: 0, failed: 0 },
-    prompts: { scanned: 0, synced: 0, failed: 0 }
+    promptEvents: { scanned: 0, synced: 0, skipped: 0, failed: 0 }
   };
 
   try {
     await ensureLocalSyncRows(source);
 
     if (dryRun) {
-      const preview = await source.query(
+      const statuses = syncStatuses();
+      const promptPreview = await source.query(
         `SELECT count(*)::int AS count
-         FROM awesome_image2_prompt_export
-         WHERE cardinality(image_urls) > 0
-           ${syncStatuses() ? "AND sync_status = ANY($1::text[])" : ""}`,
-        syncStatuses() ? [syncStatuses()] : []
+         FROM prompt_sync_events
+         WHERE target_system = $1
+           ${statuses ? "AND sync_status = ANY($2::text[])" : ""}`,
+        statuses ? [targetSystem, statuses] : [targetSystem]
       );
-      summary.prompts.scanned = preview.rows[0]?.count || 0;
+      const categoryPreview = await source.query(
+        `SELECT count(*)::int AS count
+         FROM prompt_category_sync_events
+         WHERE target_system = $1
+           ${statuses ? "AND sync_status = ANY($2::text[])" : ""}`,
+        statuses ? [targetSystem, statuses] : [targetSystem]
+      );
+      summary.promptEvents.scanned = promptPreview.rows[0]?.count || 0;
+      summary.categoryEvents.scanned = categoryPreview.rows[0]?.count || 0;
       console.log(JSON.stringify(summary, null, 2));
       return;
     }
@@ -357,18 +479,24 @@ async function main() {
       }
     }
 
-    const rows = await loadPromptRows(source);
-    summary.prompts.scanned = rows.length;
-    for (const row of rows) {
+    const promptEvents = await loadPromptEvents(source);
+    summary.promptEvents.scanned = promptEvents.length;
+    for (const event of promptEvents) {
       try {
-        if (!dryRun) {
-          const result = await upsertPrompt(target, row);
-          await markPromptSynced(source, row, result);
-        }
-        summary.prompts.synced += 1;
+        const result = await syncPromptEvent(source, target, event);
+        if (result.skipped) summary.promptEvents.skipped += 1;
+        else summary.promptEvents.synced += 1;
       } catch (error) {
-        await markPromptFailed(source, row, error);
-        summary.prompts.failed += 1;
+        await markPromptEvent(source, event, "failed", error.message || error);
+        if (event.approved_prompt_id) {
+          await markApprovedPromptSync(
+            source,
+            { approved_prompt_id: event.approved_prompt_id, target_prompt_id: event.target_prompt_id, target_slug: event.target_slug },
+            "failed",
+            error.message || error
+          );
+        }
+        summary.promptEvents.failed += 1;
       }
     }
 

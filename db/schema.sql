@@ -49,7 +49,10 @@ CREATE TABLE IF NOT EXISTS app_sessions (
 CREATE TABLE IF NOT EXISTS prompt_categories (
   id BIGSERIAL PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
+  slug TEXT,
+  description TEXT,
   aliases TEXT[] NOT NULL DEFAULT '{}',
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
   sync_key TEXT,
   target_category_name TEXT,
   sync_status TEXT NOT NULL DEFAULT 'pending',
@@ -164,6 +167,28 @@ CREATE TABLE IF NOT EXISTS approved_prompt_syncs (
     CHECK (sync_status IN ('pending', 'synced', 'failed', 'skipped'))
 );
 
+CREATE TABLE IF NOT EXISTS prompt_sync_events (
+  id BIGSERIAL PRIMARY KEY,
+  target_system TEXT NOT NULL DEFAULT 'awesome-image2-web',
+  event_type TEXT NOT NULL,
+  approved_prompt_id BIGINT,
+  raw_prompt_id BIGINT,
+  target_prompt_id TEXT NOT NULL,
+  target_slug TEXT,
+  snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+  sync_status TEXT NOT NULL DEFAULT 'pending',
+  sync_error TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  event_key TEXT UNIQUE,
+  created_by TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  processed_at TIMESTAMPTZ,
+  CONSTRAINT prompt_sync_events_type_check
+    CHECK (event_type IN ('upsert', 'category_update', 'reject', 'delete')),
+  CONSTRAINT prompt_sync_events_status_check
+    CHECK (sync_status IN ('pending', 'synced', 'failed', 'skipped'))
+);
+
 ALTER TABLE twitter_creators
   ADD COLUMN IF NOT EXISTS discovery_source TEXT,
   ADD COLUMN IF NOT EXISTS discovery_query TEXT,
@@ -176,6 +201,9 @@ ALTER TABLE twitter_creators
   ADD COLUMN IF NOT EXISTS last_scrape_error TEXT;
 
 ALTER TABLE prompt_categories
+  ADD COLUMN IF NOT EXISTS slug TEXT,
+  ADD COLUMN IF NOT EXISTS description TEXT,
+  ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE,
   ADD COLUMN IF NOT EXISTS sync_key TEXT,
   ADD COLUMN IF NOT EXISTS target_category_name TEXT,
   ADD COLUMN IF NOT EXISTS sync_status TEXT NOT NULL DEFAULT 'pending',
@@ -201,10 +229,15 @@ SET sync_key = 'category:' || id::text
 WHERE sync_key IS NULL OR sync_key = '';
 
 UPDATE prompt_categories
+SET slug = 'category-' || id::text
+WHERE slug IS NULL OR slug = '';
+
+UPDATE prompt_categories
 SET target_category_name = name
 WHERE target_category_name IS NULL OR target_category_name = '';
 
 ALTER TABLE prompt_categories
+  ALTER COLUMN slug SET NOT NULL,
   ALTER COLUMN sync_key SET NOT NULL,
   ALTER COLUMN target_category_name SET NOT NULL;
 
@@ -279,6 +312,9 @@ CREATE INDEX IF NOT EXISTS idx_prompt_categories_sort_order
 CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_categories_sync_key
   ON prompt_categories(sync_key);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_categories_slug
+  ON prompt_categories(slug);
+
 CREATE INDEX IF NOT EXISTS idx_prompt_categories_sync_status
   ON prompt_categories(sync_status, updated_at DESC);
 
@@ -287,6 +323,12 @@ CREATE INDEX IF NOT EXISTS idx_prompt_category_sync_events_status
 
 CREATE INDEX IF NOT EXISTS idx_approved_prompt_syncs_status
   ON approved_prompt_syncs(target_system, sync_status, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_prompt_sync_events_status
+  ON prompt_sync_events(target_system, sync_status, created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_prompt_sync_events_target_prompt
+  ON prompt_sync_events(target_system, target_prompt_id);
 
 DROP INDEX IF EXISTS idx_approved_prompt_templates_source_url_unique;
 
@@ -299,9 +341,33 @@ SELECT id, 'awesome-image2-web', 'iac_prompt_' || id::text, 'image-auto-' || id:
 FROM approved_prompt_templates
 ON CONFLICT (approved_prompt_id, target_system) DO NOTHING;
 
+INSERT INTO prompt_sync_events
+  (target_system, event_type, approved_prompt_id, raw_prompt_id, target_prompt_id, target_slug, snapshot, event_key, created_by)
+SELECT
+  'awesome-image2-web',
+  'upsert',
+  approved.id,
+  approved.raw_prompt_id,
+  COALESCE(sync.target_prompt_id, 'iac_prompt_' || approved.id::text),
+  COALESCE(sync.target_slug, 'image-auto-' || approved.id::text),
+  jsonb_build_object(
+    'reason', 'bootstrap',
+    'approvedPromptId', approved.id,
+    'promptHash', approved.prompt_hash,
+    'category', approved.category
+  ),
+  'awesome-image2-web:bootstrap:approved:' || approved.id::text,
+  'system'
+FROM approved_prompt_templates approved
+LEFT JOIN approved_prompt_syncs sync
+  ON sync.approved_prompt_id = approved.id
+ AND sync.target_system = 'awesome-image2-web'
+ON CONFLICT (event_key) DO NOTHING;
+
 CREATE OR REPLACE VIEW awesome_image2_prompt_export AS
 SELECT
   approved.id AS approved_prompt_id,
+  approved.raw_prompt_id,
   COALESCE(sync.target_prompt_id, 'iac_prompt_' || approved.id::text) AS target_prompt_id,
   COALESCE(sync.target_slug, 'image-auto-' || approved.id::text) AS target_slug,
   COALESCE(NULLIF(approved.title, ''), NULLIF(approved.prompt_preview, ''), 'Prompt ' || approved.id::text) AS title,

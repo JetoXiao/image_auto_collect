@@ -122,6 +122,31 @@
           </details>
         </section>
 
+        <section class="scrape-panel sync-panel" aria-label="awesome-image2 sync">
+          <div class="scrape-main">
+            <div class="scrape-title-row">
+              <div>
+                <p class="scrape-kicker">awesome-image2 同步</p>
+                <h2>已通过提示词自动同步</h2>
+              </div>
+              <span id="awesomeSyncStatusText" class="scrape-status idle">未启动</span>
+            </div>
+            <div class="scrape-progress" aria-label="awesome-image2 sync progress">
+              <span id="awesomeSyncProgressBar"></span>
+            </div>
+            <div id="awesomeSyncProgressLabel" class="scrape-progress-label">等待同步</div>
+            <div id="awesomeSyncDelta" class="scrape-delta"></div>
+          </div>
+          <div class="scrape-actions">
+            <button id="awesomeSyncStart" class="approve" type="button">同步待处理</button>
+            <button id="awesomeSyncRequeue" type="button">全量对齐</button>
+          </div>
+          <details class="scrape-log-box">
+            <summary>同步日志</summary>
+            <pre id="awesomeSyncLogs"></pre>
+          </details>
+        </section>
+
         <section class="schedule-panel" aria-label="定时采集">
           <div class="section-head">
             <div>

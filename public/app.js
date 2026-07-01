@@ -62,6 +62,13 @@ const doingfbTask = document.querySelector("#doingfbTask");
 const doingfbLogs = document.querySelector("#doingfbLogs");
 const doingfbStart = document.querySelector("#doingfbStart");
 const doingfbStop = document.querySelector("#doingfbStop");
+const awesomeSyncStatusText = document.querySelector("#awesomeSyncStatusText");
+const awesomeSyncProgressBar = document.querySelector("#awesomeSyncProgressBar");
+const awesomeSyncProgressLabel = document.querySelector("#awesomeSyncProgressLabel");
+const awesomeSyncDelta = document.querySelector("#awesomeSyncDelta");
+const awesomeSyncLogs = document.querySelector("#awesomeSyncLogs");
+const awesomeSyncStart = document.querySelector("#awesomeSyncStart");
+const awesomeSyncRequeue = document.querySelector("#awesomeSyncRequeue");
 const scheduleForm = document.querySelector("#scheduleForm");
 const scheduleStartTime = document.querySelector("#scheduleStartTime");
 const scheduleEndTime = document.querySelector("#scheduleEndTime");
@@ -97,6 +104,7 @@ let activeImageIndex = 0;
 let activeImageTitle = "";
 let scrapePollTimer = null;
 let doingfbPollTimer = null;
+let awesomeSyncPollTimer = null;
 
 const statusLabels = {
   pending: "待审核",
@@ -131,6 +139,13 @@ const doingfbStatusLabels = {
   reviewing: "自动初审中",
   stopping: "停止中",
   stopped: "已停止",
+  completed: "已完成",
+  error: "异常"
+};
+
+const awesomeSyncStatusLabels = {
+  idle: "未启动",
+  running: "同步中",
   completed: "已完成",
   error: "异常"
 };
@@ -484,6 +499,85 @@ function stopScrapePolling() {
   if (!scrapePollTimer) return;
   window.clearInterval(scrapePollTimer);
   scrapePollTimer = null;
+}
+
+function renderAwesomeSyncStatus(data) {
+  const status = data.status || "idle";
+  const progress = Math.max(0, Math.min(100, Number(data.progress || 0)));
+  awesomeSyncStatusText.textContent = awesomeSyncStatusLabels[status] || status;
+  awesomeSyncStatusText.className = `scrape-status ${status}`;
+  awesomeSyncProgressBar.style.width = `${progress}%`;
+  awesomeSyncProgressLabel.textContent =
+    status === "idle"
+      ? "等待同步"
+      : `${progress}% · 待处理 ${data.counts?.pendingTotal || 0} · 已同步 ${data.counts?.approvedSyncs?.synced || 0}`;
+
+  awesomeSyncDelta.innerHTML = [
+    ["待同步", data.counts?.pendingTotal || 0],
+    ["提示词事件", (data.counts?.promptEvents?.pending || 0) + (data.counts?.promptEvents?.failed || 0)],
+    ["分类事件", (data.counts?.categoryEvents?.pending || 0) + (data.counts?.categoryEvents?.failed || 0)],
+    ["已同步", data.counts?.approvedSyncs?.synced || 0],
+    ...(data.summary?.promptEvents
+      ? [
+          ["本轮同步", data.summary.promptEvents.synced || 0],
+          ["跳过", data.summary.promptEvents.skipped || 0]
+        ]
+      : [])
+  ].map(([label, value]) => `<span><b>${escapeHtml(value)}</b>${label}</span>`).join("");
+
+  awesomeSyncLogs.textContent = (data.logs || []).join("\n");
+  awesomeSyncLogs.scrollTop = awesomeSyncLogs.scrollHeight;
+
+  awesomeSyncStart.disabled = status === "running";
+  awesomeSyncRequeue.disabled = status === "running";
+
+  if (status === "running") startAwesomeSyncPolling();
+  else stopAwesomeSyncPolling();
+}
+
+async function loadAwesomeSyncStatus() {
+  const data = await requestJson("/api/awesome-sync/status");
+  renderAwesomeSyncStatus(data);
+  if (["running", "completed", "error"].includes(data.status)) {
+    loadStats().catch(() => {});
+  }
+  return data;
+}
+
+function startAwesomeSyncPolling() {
+  if (awesomeSyncPollTimer) return;
+  awesomeSyncPollTimer = window.setInterval(() => {
+    loadAwesomeSyncStatus().catch((error) => {
+      awesomeSyncProgressLabel.textContent = `同步状态读取失败：${error.message}`;
+    });
+  }, 2000);
+}
+
+function stopAwesomeSyncPolling() {
+  if (!awesomeSyncPollTimer) return;
+  window.clearInterval(awesomeSyncPollTimer);
+  awesomeSyncPollTimer = null;
+}
+
+async function awesomeSyncAction(mode) {
+  const button = mode === "requeue-all" ? awesomeSyncRequeue : awesomeSyncStart;
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = mode === "requeue-all" ? "对齐中..." : "同步中...";
+  try {
+    const data = await requestJson("/api/awesome-sync/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode })
+    });
+    renderAwesomeSyncStatus(data);
+    await Promise.all([loadStats(), state.tab === "scrape" ? loadAwesomeSyncStatus() : Promise.resolve()]);
+  } catch (error) {
+    window.alert(error.message);
+    await loadAwesomeSyncStatus().catch(() => {});
+  } finally {
+    button.textContent = oldText;
+  }
 }
 
 async function scrapeAction(action) {
@@ -947,7 +1041,7 @@ async function applyBulkCategory() {
     body: JSON.stringify({ ids, category })
   });
   state.approved.selected.clear();
-  await Promise.all([loadApprovedPrompts(), loadStats()]);
+  await Promise.all([loadApprovedPrompts(), loadStats(), loadAwesomeSyncStatus().catch(() => {})]);
   window.alert(`已修改 ${data.updated || 0} 条`);
 }
 
@@ -958,7 +1052,7 @@ async function rejectApprovedPrompt(id) {
     body: JSON.stringify({ reason: "管理员从已通过列表退回" })
   });
   state.approved.selected.delete(Number(id));
-  await Promise.all([loadApprovedPrompts(), loadStats()]);
+  await Promise.all([loadApprovedPrompts(), loadStats(), loadAwesomeSyncStatus().catch(() => {})]);
 }
 
 function renderPrompts(items) {
@@ -1083,7 +1177,7 @@ async function approvePrompt(id, promptEdit) {
     await requestJson(`/api/raw-prompts/${id}/approve`, {
       method: "POST"
     });
-    await refresh();
+    await Promise.all([refresh(), loadAwesomeSyncStatus().catch(() => {})]);
   } catch (error) {
     if (error.message === "PROMPT_SAFETY_BLOCKED") {
       window.alert("命中安全红线，已自动驳回，不能上架。");
@@ -1123,12 +1217,12 @@ async function rejectPrompt(id) {
   await requestJson(`/api/raw-prompts/${id}/reject`, {
     method: "POST"
   });
-  await refresh();
+  await Promise.all([refresh(), loadAwesomeSyncStatus().catch(() => {})]);
 }
 
 async function markPending(id) {
   await requestJson(`/api/raw-prompts/${id}/pending`, { method: "POST" });
-  await refresh();
+  await Promise.all([refresh(), loadAwesomeSyncStatus().catch(() => {})]);
 }
 
 async function runAutoReview() {
@@ -1146,7 +1240,8 @@ async function runAutoReview() {
     state.approved.selected.clear();
     await Promise.all([
       refresh(),
-      state.tab === "approved" ? loadApprovedPrompts() : Promise.resolve()
+      state.tab === "approved" ? loadApprovedPrompts() : Promise.resolve(),
+      loadAwesomeSyncStatus().catch(() => {})
     ]);
     window.alert(
       `智能初审完成：扫描 ${data.scanned || 0} 条，通过 ${data.approved || 0} 条，重复 ${data.duplicate || 0} 条，驳回 ${data.rejected || 0} 条，清洗 ${data.cleaned || 0} 条，失败 ${data.failed || 0} 条`
@@ -1174,7 +1269,7 @@ async function switchTab(tab) {
   if (tab === "review") {
     await refresh();
   } else if (tab === "scrape") {
-    await Promise.all([loadStats(), loadScrapeStatus(), loadDoingfbStatus(), loadSchedules(), loadScrapeHistory()]);
+    await Promise.all([loadStats(), loadScrapeStatus(), loadDoingfbStatus(), loadAwesomeSyncStatus(), loadSchedules(), loadScrapeHistory()]);
   } else if (tab === "creators") {
     await Promise.all([loadStats(), loadCreators()]);
   } else if (tab === "approved") {
@@ -1224,9 +1319,11 @@ scrapeResume.addEventListener("click", () => scrapeAction("resume"));
 scrapeStop.addEventListener("click", () => scrapeAction("stop"));
 doingfbStart.addEventListener("click", () => doingfbAction("start"));
 doingfbStop.addEventListener("click", () => doingfbAction("stop"));
+awesomeSyncStart.addEventListener("click", () => awesomeSyncAction("pending"));
+awesomeSyncRequeue.addEventListener("click", () => awesomeSyncAction("requeue-all"));
 scheduleForm.addEventListener("submit", (event) => addSchedule(event).catch((error) => window.alert(error.message)));
 document.querySelector("#scrapeHistoryRefresh").addEventListener("click", () =>
-  Promise.all([loadScrapeStatus(), loadDoingfbStatus(), loadSchedules(), loadScrapeHistory()]).catch((error) => window.alert(error.message))
+  Promise.all([loadScrapeStatus(), loadDoingfbStatus(), loadAwesomeSyncStatus(), loadSchedules(), loadScrapeHistory()]).catch((error) => window.alert(error.message))
 );
 document.querySelector("#lightboxClose").addEventListener("click", closeLightbox);
 lightbox.addEventListener("click", (event) => {
@@ -1345,6 +1442,9 @@ loadCurrentUser()
       }),
       loadDoingfbStatus().catch((error) => {
         doingfbProgressLabel.textContent = `DoingFB 状态读取失败：${error.message}`;
+      }),
+      loadAwesomeSyncStatus().catch((error) => {
+        awesomeSyncProgressLabel.textContent = `同步状态读取失败：${error.message}`;
       }),
       loadSchedules().catch(() => {}),
       loadScrapeHistory().catch(() => {})

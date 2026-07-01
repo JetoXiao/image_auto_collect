@@ -2113,7 +2113,9 @@ async function completeScrapeRun(tasks = Object.values(scrapeRun.tasks || {})) {
   else if (tasks.some((task) => task.status === "failed")) finalStatus = "error";
   else finalStatus = "completed";
   let autoReviewSummary = null;
-  if (finalStatus === "completed" && scrapeRun.startedAt) {
+  const shouldAutoReview =
+    scrapeRun.startedAt && (finalStatus === "completed" || (scrapeRun.trigger === "schedule" && finalStatus === "stopped"));
+  if (shouldAutoReview) {
     scrapeRun.status = "reviewing";
     addScrapeLog("开始自动初审本轮新增提示词");
     try {
